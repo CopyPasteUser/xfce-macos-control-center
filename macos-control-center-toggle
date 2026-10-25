@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# Self-healing, release-aware resident toggle. Never signals a daemon from an
+# obsolete checkout; it replaces that daemon with the binary selected by this helper.
+set -u
+
+USER_ID=$(id -u)
+APP_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/macos-control-center"
+APP="$APP_ROOT/app/macos-control-center"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+PYTHON="$(command -v python3 2>/dev/null || true)"
+
+# A helper inside a project checkout intentionally targets that checkout; the
+# installed helper (under APP_ROOT/scripts) targets the persistent install.
+if [[ -r "$HERE/macos-control-center" && -r "$HERE/VERSION" ]]; then
+  APP="$HERE/macos-control-center"
+fi
+if [[ -z "$PYTHON" || ! -r "$APP" ]]; then
+  message="Control Center kann nicht gestartet werden. Prüfe Python 3 und die Installation."
+  command -v notify-send >/dev/null 2>&1 && notify-send "Control Center" "$message" >/dev/null 2>&1 || true
+  echo "$message" >&2
+  exit 1
+fi
+APP=$(readlink -f -- "$APP" 2>/dev/null || printf '%s' "$APP")
+APP_DIR=$(dirname -- "$APP")
+EXPECTED_VERSION=$(cat "$APP_DIR/VERSION" 2>/dev/null || true)
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+if [[ ! -d "$RUNTIME_DIR" || ! -w "$RUNTIME_DIR" ]]; then RUNTIME_DIR="/tmp"; fi
+export XDG_RUNTIME_DIR="$RUNTIME_DIR"
+PIDFILE="${CC_PIDFILE:-$RUNTIME_DIR/macos-control-center.pid}"
+STATEFILE="${CC_STATEFILE:-$PIDFILE.state.json}"
+LOG="$APP_ROOT/logs/daemon.log"
+if [[ "$APP" == "$HERE/macos-control-center" ]]; then LOG="$HERE/daemon.log"; fi
+mkdir -p "$(dirname "$PIDFILE")" "$(dirname "$STATEFILE")" "$(dirname "$LOG")" 2>/dev/null || true
+(umask 077; touch "$LOG" 2>/dev/null || true)
+chmod 0600 "$LOG" 2>/dev/null || true
+
+rotate_log_if_needed() {
+  local size
+  size=$(stat -c '%s' "$LOG" 2>/dev/null || echo 0)
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
+  (( size >= 1048576 )) || return 0
+  rm -f -- "$LOG.3"
+  [[ ! -f "$LOG.2" ]] || mv -f -- "$LOG.2" "$LOG.3"
+  [[ ! -f "$LOG.1" ]] || mv -f -- "$LOG.1" "$LOG.2"
+  mv -f -- "$LOG" "$LOG.1"
+  (umask 077; : > "$LOG")
+  chmod 0600 "$LOG" 2>/dev/null || true
+}
+
+# Serialise starts so two panel clicks cannot launch duplicate resident windows.
+LOCKFILE="$RUNTIME_DIR/macos-control-center-toggle-$USER_ID.lock"
+exec 9>"$LOCKFILE"
+if command -v flock >/dev/null 2>&1 && ! flock -w 6 9; then
+  echo "Control Center wird gerade gestartet; bitte kurz erneut klicken." >&2
+  exit 0
+fi
+
+proc_alive() {
+  local pid="$1" state
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || return 1
+  [[ -r "/proc/$pid/status" ]] || return 1
+  state=$(awk '$1 == "State:" {print $2; exit}' "/proc/$pid/status" 2>/dev/null || true)
+  [[ -n "$state" && "$state" != "Z" ]]
+}
+
+proc_args_array() {
+  local pid="$1" uid
+  [[ -r "/proc/$pid/status" && -r "/proc/$pid/cmdline" ]] || return 1
+  uid=$(awk '$1 == "Uid:" {print $2; exit}' "/proc/$pid/status" 2>/dev/null || true)
+  [[ "$uid" == "$USER_ID" ]] || return 1
+  local -a args=()
+  mapfile -d '' -t args < "/proc/$pid/cmdline" 2>/dev/null || true
+  ((${#args[@]} >= 2)) || return 1
+  case "${args[0]##*/}" in python|python[0-9]*|pypy|pypy[0-9]*) ;; *) return 1 ;; esac
+  [[ "${args[1]##*/}" == "macos-control-center" ]] || return 1
+  printf '%s\0' "${args[@]}"
+}
+
+proc_script() {
+  local pid="$1"
+  # Decode argv directly; process paths can contain spaces.
+  local -a args=()
+  mapfile -d '' -t args < <(proc_args_array "$pid")
+  ((${#args[@]} >= 2)) || return 1
+  readlink -f -- "${args[1]}" 2>/dev/null || printf '%s' "${args[1]}"
+}
+
+is_control_center() { proc_args_array "$1" >/dev/null 2>&1; }
+proc_is_resident() {
+  local pid="$1"
+  local -a args=()
+  mapfile -d '' -t args < <(proc_args_array "$pid")
+  local arg
+  for arg in "${args[@]}"; do [[ "$arg" == "--daemon" ]] && return 0; done
+  return 1
+}
+
+runtime_matches() {
+  local pid="$1"
+  [[ -r "$STATEFILE" ]] || return 1
+  "$PYTHON" - "$STATEFILE" "$pid" "$EXPECTED_VERSION" "$APP" <<'PY'
+import json, os, sys
+state_path, pid, expected_version, expected_script = sys.argv[1:]
+try:
+    with open(state_path, encoding="utf-8") as f:
+        state = json.load(f)
+    ok = (
+        isinstance(state, dict)
+        and state.get("pid") == int(pid)
+        and state.get("resident") is True
+        and isinstance(state.get("visible"), bool)
+        and os.path.realpath(state.get("script", "")) == os.path.realpath(expected_script)
+        and (not expected_version or state.get("version") == expected_version)
+    )
+    raise SystemExit(0 if ok else 1)
+except (OSError, ValueError, TypeError):
+    raise SystemExit(1)
+PY
+}
+
+wait_ready() {
+  local pid="$1" tries="${2:-70}"
+  local i
+  for ((i=0; i<tries; i++)); do
+    proc_alive "$pid" || return 1
+    if is_control_center "$pid" && proc_is_resident "$pid" && [[ "$(proc_script "$pid")" == "$APP" ]] && runtime_matches "$pid"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+stop_old_process() {
+  local pid="$1" i
+  if ! proc_alive "$pid" || ! is_control_center "$pid"; then return 0; fi
+  echo "Beende veraltete Control-Center-Instanz (PID $pid) …" | tee -a "$LOG" >/dev/null
+  kill -TERM "$pid" 2>/dev/null || true
+  for ((i=0; i<50; i++)); do proc_alive "$pid" || return 0; sleep 0.1; done
+  echo "Control Center (PID $pid) reagiert nicht auf TERM. Siehe $LOG" >&2
+  return 1
+}
+
+runtime_visibility() {
+  local pid="$1"
+  "$PYTHON" - "$STATEFILE" "$pid" "$EXPECTED_VERSION" "$APP" <<'PYVIS'
+import json, os, sys
+state_path, pid, expected_version, expected_script = sys.argv[1:]
+try:
+    with open(state_path, encoding="utf-8") as handle:
+        state = json.load(handle)
+    if (not isinstance(state, dict)
+            or state.get("pid") != int(pid)
+            or state.get("resident") is not True
+            or not isinstance(state.get("visible"), bool)
+            or os.path.realpath(state.get("script", "")) != os.path.realpath(expected_script)
+            or (expected_version and state.get("version") != expected_version)):
+        print("unknown")
+    else:
+        print("visible" if state["visible"] else "hidden")
+except (OSError, ValueError, TypeError):
+    print("unknown")
+PYVIS
+}
+
+signal_toggle() {
+  local pid="$1" visibility signal_name
+  visibility=$(runtime_visibility "$pid" 2>/dev/null || echo unknown)
+  # SIGUSR1 means explicit show; SIGUSR2 means explicit hide. This avoids
+  # treating every click as "show", which made the popup impossible to close.
+  if [[ "$visibility" == "visible" ]]; then
+    signal_name=USR2
+  else
+    signal_name=USR1
+  fi
+  if kill -s "$signal_name" "$pid" 2>/dev/null; then
+    echo "Control Center umgeschaltet (PID $pid, Version ${EXPECTED_VERSION:-unbekannt}; Ziel: ${visibility})."
+    return 0
+  fi
+  return 1
+}
+
+# PID-file owner: reuse only if the exact current release has published ready state.
+PID=""
+if [[ -r "$PIDFILE" ]]; then IFS= read -r PID < "$PIDFILE" || true; fi
+if [[ "$PID" =~ ^[0-9]+$ ]] && proc_alive "$PID" && is_control_center "$PID"; then
+  CURRENT_SCRIPT=$(proc_script "$PID" || true)
+  if [[ "$CURRENT_SCRIPT" == "$APP" ]] && proc_is_resident "$PID"; then
+    if wait_ready "$PID" 100; then
+      if signal_toggle "$PID"; then exit 0; fi
+    fi
+    echo "Resident-Prozess ist nicht bereit oder hat einen abweichenden Laufzeitstand; Neustart wird vorbereitet." >> "$LOG"
+  fi
+  stop_old_process "$PID" || exit 2
+elif [[ -n "$PID" ]]; then
+  # Never kill a PID-reused unrelated process.
+  if [[ "$PID" =~ ^[0-9]+$ ]]; then
+    mv -f -- "$PIDFILE" "$PIDFILE.stale.$(date +%s).$$" 2>/dev/null || true
+  fi
+fi
+
+# Old processes from a source checkout used to be reused by mistake. Stop any
+# current-user resident whose code path is not this selected release.
+for proc in /proc/[0-9]*; do
+  candidate="${proc##*/}"
+  [[ "$candidate" == "$$" || "$candidate" == "$PPID" ]] && continue
+  proc_alive "$candidate" || continue
+  is_control_center "$candidate" || continue
+  proc_script "$candidate" >/dev/null 2>&1 || continue
+  candidate_script=$(proc_script "$candidate" || true)
+  if [[ "$candidate_script" == "$APP" ]] && proc_is_resident "$candidate"; then
+    if wait_ready "$candidate" 100; then
+      signal_toggle "$candidate" && exit 0
+    fi
+  fi
+  # Any other same-user process using this app name is transient, stale, or
+  # from another checkout. Never leave it behind beside the selected resident.
+  stop_old_process "$candidate" || exit 2
+done
+
+# Clear metadata only after no known process remains. Then start the selected copy.
+rotate_log_if_needed
+if [[ -e "$PIDFILE" ]]; then
+  old_owner=$(cat "$PIDFILE" 2>/dev/null || true)
+  if [[ ! "$old_owner" =~ ^[0-9]+$ ]] || ! proc_alive "$old_owner"; then rm -f -- "$PIDFILE"; fi
+fi
+rm -f -- "$STATEFILE"
+CC_PIDFILE="$PIDFILE" CC_STATEFILE="$STATEFILE" XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  nohup "$PYTHON" "$APP" --daemon >>"$LOG" 2>&1 9>&- </dev/null &
+LAUNCH_PID=$!
+READY_PID=""
+for _ in $(seq 1 100); do
+  if [[ -r "$PIDFILE" ]]; then
+    candidate=$(cat "$PIDFILE" 2>/dev/null || true)
+    if [[ "$candidate" =~ ^[0-9]+$ ]] && wait_ready "$candidate" 1; then
+      READY_PID="$candidate"
+      break
+    fi
+  fi
+  proc_alive "$LAUNCH_PID" || break
+  sleep 0.1
+done
+
+if [[ -z "$READY_PID" ]]; then
+  message="Control Center konnte nicht gestartet werden. Details: $LOG"
+  echo "$message" >&2
+  tail -30 "$LOG" >&2 2>/dev/null || true
+  command -v notify-send >/dev/null 2>&1 && notify-send "Control Center" "$message" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+if ! kill -USR1 "$READY_PID" 2>/dev/null; then
+  echo "Control Center läuft (PID $READY_PID), konnte aber nicht geöffnet werden. Details: $LOG" >&2
+  exit 1
+fi
+echo "Control Center bereit und geöffnet (PID $READY_PID, Version ${EXPECTED_VERSION:-unbekannt})."
