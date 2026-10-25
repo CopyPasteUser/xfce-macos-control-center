@@ -8,6 +8,10 @@
 
 > **Vibe-coded project:** the product direction, UX decisions, testing, and hardware-specific validation are mine; AI-assisted development was used to implement and refine parts of the project.
 
+## Screenshots
+
+Actual application screenshots will appear here when the current build is uploaded. Suggested views: main panel, network tab, media controls, quick notes, storage analyzer, fan controls, and settings. This section intentionally contains no mockups presented as real UI.
+
 ## Project status
 
 This repository currently contains the project documentation. The existing application source and release package still need to be uploaded before the installation commands below can be used unchanged.
