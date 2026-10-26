@@ -68,16 +68,16 @@ class Idle:
         if 'vol' in args[0]: quick.set()
         return 1
 ns.update(GLib=Idle, which=lambda command: True, wifi_on=lambda: True, wifi_ssid=lambda:'Test',
-          vpn_state=lambda:([],''), volume_pct=lambda:37, sink_muted=lambda:False,
+          vpn_state=lambda:([],''), volume_pct=lambda backend=None:37, sink_muted=lambda backend=None:False,
           brightness_pct=lambda:(50,100),kbd_pct=lambda:(None,0),battery=lambda:(None,''),
           battery_extra=lambda:None,nightshift_on=lambda:None,media_info=lambda:None)
 def slow():
     assert release.wait(2)
-    return True
-ns['bt_on']=slow
+    return {'status':'ready','powered':True}
+ns['bluetooth_state']=slow
 poll=method('_poll_collect')
 with ThreadPoolExecutor(max_workers=4) as pool:
-    subject=types.SimpleNamespace(_poll_executor=pool,btn_ns=None,_specs=[{'key':'broken','read':lambda:1/0}],_apply=lambda d:None)
+    subject=types.SimpleNamespace(_bt_generation=0,_audio_control_backend='pactl',_poll_executor=pool,btn_ns=None,_specs=[{'key':'broken','read':lambda:1/0}],_apply=lambda d:None)
     result={}
     worker=threading.Thread(target=lambda: result.update(poll(subject,1)))
     worker.start()
@@ -87,7 +87,7 @@ with ThreadPoolExecutor(max_workers=4) as pool:
     release.set();worker.join(2)
     assert not worker.is_alive()
     assert result['_errors']==['broken']
-    assert any(d.get('bt') is True for d in delivered)
+    assert any(d.get('bt',{}).get('powered') is True for d in delivered)
 print('V2-POLL-INDEPENDENCE-FAILURE-ISOLATION-OK')
 
 # Apply every sparse result independently, then finish and settle poll state.
@@ -98,6 +98,7 @@ class Widget:
 ns.update(GLib=types.SimpleNamespace(get_monotonic_time=lambda:100,idle_add=lambda *a:None),KBD_DIR=None,T=lambda k,**kw:k)
 apply=method('_apply')
 a=types.SimpleNamespace(_destroyed=False,_updating=False,_polling=True,_poll_errors=[],_poll_ms=0,
+  _bt_pending=False,_bt_generation=0,
   _profile_pending=False,_rerun=False,_resident_primed=False,_st={},_hold=0,_muted=False,
   btn_wifi=(None,None,Widget()),btn_bt=(None,None,Widget()),btn_ns=None,bl_mod=None,
   vol_mod=types.SimpleNamespace(scale=Widget()),_bat_lab=None,_specs=[],_last_tt='',

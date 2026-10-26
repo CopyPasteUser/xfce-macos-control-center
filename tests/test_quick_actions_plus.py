@@ -52,7 +52,7 @@ assert 'self._power_icon_action' in power
 assert 'self._item(' not in power, "Energiemenü verwendet noch Text-Aktionszeilen"
 assert 'def _settings_candidates(key):' in text
 assert 'def notification_dnd_state()' in text
-assert 'color=(ACCENT if initial_on else "#ffffff")' in text
+assert 'color=(ACCENT if initial_on else _inactive_icon_color())' in text
 assert 'rgba(10,132,255,0.17)' in text
 print("QUICK-ACTIONS-PLUS-OK")
 print("ICON-RAIL-OK")

@@ -1,23 +1,21 @@
 # macOS Control Center
 
-**Version 2.0.0 · GTK 3 / Python · Linux Mint XFCE und kompatible X11-Desktops**
+**Version 2.1.0 · GTK 3 / Python · Linux Mint XFCE und kompatible X11-Desktops**
 
 Ein kompaktes, macOS-inspiriertes Control Center für Linux. Es bündelt häufig benötigte Systemschalter, Regler, Mediensteuerung und individuell sortierbare Schnellaktionen in einem schwebenden Popup. Das Programm ist ein eigenständiges GTK-Fenster – kein XFCE-Panel-Plugin – und verändert keine globalen Desktop-Themes oder Panel-Einstellungen.
 
 > Zielplattform ist ein klassischer X11-Desktop, besonders XFCE. Unter Wayland kann die Fensterpositionierung je nach Compositor eingeschränkt sein.
 
-> **Vibe-coded:** Idee, Anforderungen, Tests und Produktentscheidungen stammen von mir; bei Implementierung und Iteration habe ich KI-Unterstützung verwendet.
+## Neu in 2.1
 
-## Screenshots
+2.1 härtet die bestehende Control-Center-Oberfläche und ihre Hardwarepfade,
+ohne Main-UI oder Navigation neu zu bauen. Settings, Audio, Bluetooth,
+Konfiguration und Hintergrund-Worker liefern jetzt nachvollziehbare Endzustände.
+Read-only-Diagnosemodi helfen bei der Prüfung auf realer XFCE-Hardware.
 
-Echte Screenshots der aktuellen GTK-Oberfläche folgen. Das Repository enthält den vollständigen Quellcode und die Start-/Installationsskripte.
-
-## Neu in 2.0
-
-2.0 ergänzt den vorhandenen GTK-Unterbau um eine kompakte Aktionsoberfläche,
-einen Gerätebereich und einen Fokus-Timer. Die vorhandene Konfiguration und
-Notizen werden weiterverwendet. Die App bleibt eigenständig und verändert keine
-globalen Desktop-Designs.
+Die Version 2.0 bleibt die stabile visuelle Basis; Konfiguration und Notizen
+werden weiterverwendet. Die App bleibt eigenständig und verändert keine globalen
+Desktop-Designs.
 
 ### Aktionen schneller finden
 

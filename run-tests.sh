@@ -27,6 +27,14 @@ python3 tests/test_quick_actions_plus.py || BAD=1
 python3 tests/test_product_features.py || BAD=1
 python3 tests/test_utilities.py || BAD=1
 python3 tests/test_dynamic_layout.py || BAD=1
+python3 tests/test_navigation.py || BAD=1
+python3 tests/test_hardware_backends.py || BAD=1
+python3 tests/test_runtime_integrations.py || BAD=1
+python3 tests/test_settings_themes.py || BAD=1
+python3 tests/test_settings_construction.py || BAD=1
+python3 tests/test_preferences_runtime.py || BAD=1
+python3 tests/test_diagnostics_cli.py || BAD=1
+python3 tests/strict_audit.py || BAD=1
 python3 tests/test_focus_toggle.py || BAD=1
 python3 tests/test_v2.py || BAD=1
 

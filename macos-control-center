@@ -3,10 +3,12 @@
 # Popup oben rechts. Zweiter Aufruf, während es offen ist, schließt es (Toggle),
 # damit Panel-Starter und Hotkey dasselbe Kommando nutzen können.
 import gi, glob, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, uuid, csv, heapq, stat
-import urllib.parse, urllib.request, socket, ipaddress, math
+import urllib.parse, urllib.request, socket, ipaddress, math, logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, Gio, GLib
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
 PIDFILE = os.environ.get("CC_PIDFILE") or os.path.join(
     os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
@@ -14,7 +16,7 @@ PIDFILE = os.environ.get("CC_PIDFILE") or os.path.join(
 # The runtime-state path is explicitly passed by the installer for verified
 # starts, and defaults next to the PID file for direct/source-tree launches.
 STATEFILE = os.environ.get("CC_STATEFILE") or (PIDFILE + ".state.json")
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 PROCESS_STARTED_AT = time.strftime("%Y-%m-%dT%H:%M:%S%z")
 ACCENT = "#0a84ff"
 
@@ -42,6 +44,7 @@ QUICK_ACTION_KEYS = (
     "devices", "focus", "overview",
 )
 DEFAULT_CONFIG = {
+    "schema_version": 1,
     "vpn_preferred": VPN_PREFERRED,
     "poll_seconds": 10,
     "language": "auto",
@@ -52,18 +55,30 @@ DEFAULT_CONFIG = {
     "accent_color": "blue",
     "animation_speed": "smooth",
     "media_thumbnail": True,
+    "media_card": True,
+    "media_progress": True,
+    "media_hide_idle": False,
+    "feedback": True,
     "resource_profile": "balanced",
     "compact_actions": True,
     "devices": [],
 }
 _CFG_LANGS = ("auto", "de", "en", "it", "fr", "es")
+_CFG_THEMES = ("midnight", "graphite", "frosted", "light")
+_CFG_ACCENTS = ("blue", "purple", "teal", "pink", "red", "orange", "yellow", "green", "graphite")
 
 
 def _cfg_value(key, val):
+    if key in ("media_progress", "media_hide_idle", "feedback"):
+        return val if isinstance(val, bool) else None
+    if key == "schema_version":
+        return 1 if type(val) is int and val == 1 else None
     # gibt den bereinigten Wert zurück oder None, wenn er nicht plausibel ist
     if key == "resource_profile":
         return val if isinstance(val, str) and val in ("light", "balanced", "responsive", "custom") else None
     elif key == "compact_actions":
+        return val if isinstance(val, bool) else None
+    elif key == "media_card":
         return val if isinstance(val, bool) else None
     elif key == "devices":
         return _validate_devices(val)
@@ -91,10 +106,10 @@ def _cfg_value(key, val):
         if isinstance(val, bool):
             return val
     elif key == "theme":
-        if isinstance(val, str) and val in ("midnight", "graphite", "light"):
+        if isinstance(val, str) and val in _CFG_THEMES:
             return val
     elif key == "accent_color":
-        if isinstance(val, str) and val in ("blue", "purple", "teal", "pink"):
+        if isinstance(val, str) and val in _CFG_ACCENTS:
             return val
     elif key == "animation_speed":
         if isinstance(val, str) and val in ("smooth", "fast", "off"):
@@ -210,14 +225,41 @@ def _persist_config(cfg):
     fd = None
     tmp = None
     try:
+        if os.path.islink(CONFIG_DIR) or os.path.islink(CONFIG_FILE):
+            return False
         os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
         os.chmod(CONFIG_DIR, 0o700)
+        # Preserve corrupt data for recovery before replacing it with defaults.
+        # Refuse to downgrade a config written by a newer schema.
+        previous = {}
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "rb") as original:
+                raw = original.read(65537)
+            try:
+                previous = json.loads(raw)
+                if not isinstance(previous, dict):
+                    raise ValueError("config is not an object")
+                version = previous.get("schema_version", 1)
+                if type(version) is int and version > 1:
+                    return False
+            except (ValueError, UnicodeError):
+                previous = {}
+                if len(raw) > 65536:
+                    return False  # do not truncate a larger unknown file
+                backup_fd, backup = tempfile.mkstemp(prefix="config-corrupt-", suffix=".json", dir=CONFIG_DIR)
+                with os.fdopen(backup_fd, "wb") as preserved:
+                    preserved.write(raw)
+                    preserved.flush()
+                    os.fsync(preserved.fileno())
+                logging.warning("Corrupt configuration preserved in a private recovery file")
         fd, tmp = tempfile.mkstemp(prefix=".config-", dir=CONFIG_DIR)
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             fd = None
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
+            json.dump({**previous, **cfg}, f, indent=2, ensure_ascii=False)
             f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, CONFIG_FILE)
         tmp = None
         os.chmod(CONFIG_FILE, 0o600)
@@ -268,6 +310,7 @@ def load_config():
         _write_default_config()
         return cfg
     except (OSError, ValueError):
+        logging.warning("Configuration could not be read; using safe defaults")
         return cfg
     if isinstance(data, dict):
         if "resource_profile" not in data:
@@ -557,12 +600,18 @@ def _read_hwmon_sensors(hwmon_root="/sys/class/hwmon"):
     return sensors
 
 
-CFG = load_config()
+CFG = (dict(DEFAULT_CONFIG) if any(arg.startswith("--diagnose") for arg in sys.argv[1:])
+       else load_config())
 ACCENT_PALETTE = {
     "blue": ("#0a84ff", (10, 132, 255)),
     "purple": ("#8b5cf6", (139, 92, 246)),
     "teal": ("#14b8a6", (20, 184, 166)),
     "pink": ("#ec4899", (236, 72, 153)),
+    "red": ("#ff453a", (255, 69, 58)),
+    "orange": ("#ff9f0a", (255, 159, 10)),
+    "yellow": ("#ffd60a", (255, 214, 10)),
+    "green": ("#30d158", (48, 209, 88)),
+    "graphite": ("#8e929b", (142, 146, 155)),
 }
 ACCENT = ACCENT_PALETTE.get(CFG.get("accent_color", "blue"), ACCENT_PALETTE["blue"])[0]
 VPN_PREFERRED = CFG["vpn_preferred"]
@@ -602,6 +651,20 @@ STR = {
     "muted":         ("Stumm", "Muted", "Muto", "Muet", "Silenciado"),
     "open":          ("Öffnen", "Open", "Apri", "Ouvrir", "Abrir"),
     "loading":       ("Lade …", "Loading…", "Caricamento…", "Chargement…", "Cargando…"),
+    "audio_empty":   ("Keine Ausgabegeräte", "No output devices found", "Nessuna uscita audio", "Aucune sortie audio", "No hay salidas de audio"),
+    "audio_timeout": ("Audio-Backend antwortet nicht", "Audio backend timed out", "Timeout audio", "Délai audio dépassé", "Tiempo de audio agotado"),
+    "audio_backend_unavailable": ("Audio-Dienst nicht verfügbar", "Audio service unavailable", "Servizio audio non disponibile", "Service audio indisponible", "Servicio de audio no disponible"),
+    "audio_error":   ("Audio-Backend-Fehler", "Audio backend error", "Errore audio", "Erreur audio", "Error de audio"),
+    "bt_adapter_missing": ("Kein Bluetooth-Adapter", "Bluetooth adapter unavailable", "Adattatore Bluetooth non disponibile", "Adaptateur Bluetooth indisponible", "Adaptador Bluetooth no disponible"),
+    "bt_blocked":    ("Bluetooth durch Hardware blockiert", "Bluetooth is hard blocked", "Bluetooth bloccato dall'hardware", "Bluetooth bloqué par le matériel", "Bluetooth bloqueado por hardware"),
+    "bt_permission": ("Berechtigung zum Einschalten erforderlich", "Permission required to change Bluetooth", "Permesso Bluetooth necessario", "Autorisation Bluetooth requise", "Se requiere permiso para Bluetooth"),
+    "bt_service":    ("Bluetooth-Dienst nicht verfügbar", "Bluetooth service unavailable", "Servizio Bluetooth non disponibile", "Service Bluetooth indisponible", "Servicio Bluetooth no disponible"),
+    "bt_timeout":    ("Bluetooth-Zeitüberschreitung", "Bluetooth timed out", "Timeout Bluetooth", "Délai Bluetooth dépassé", "Tiempo de Bluetooth agotado"),
+    "bt_power_error": ("Bluetooth-Änderung fehlgeschlagen", "Could not change Bluetooth", "Modifica Bluetooth non riuscita", "Impossible de modifier Bluetooth", "No se pudo cambiar Bluetooth"),
+    "page_error": ("Ansicht konnte nicht geöffnet werden", "Could not open this page", "Impossibile aprire la pagina", "Impossible d’ouvrir cette page", "No se pudo abrir la página"),
+    "setting_media_progress": ("Wiedergabefortschritt", "Playback progress", "Avanzamento riproduzione", "Progression de lecture", "Progreso de reproducción"),
+    "setting_media_idle": ("Ohne Player ausblenden", "Hide when no player is available", "Nascondi senza lettore", "Masquer sans lecteur", "Ocultar sin reproductor"),
+    "setting_feedback": ("Erfolgsmeldungen", "Success feedback", "Messaggi di conferma", "Messages de confirmation", "Mensajes de confirmación"),
     "tile_wake":     ("Wach", "Awake", "Sveglio", "Éveil", "Despierto"),
     "tile_mic":      ("Mikro", "Mic", "Micro", "Micro", "Micro"),
     "tile_plane":    ("Flug", "Airplane", "Aereo", "Avion", "Avión"),
@@ -612,6 +675,7 @@ STR = {
     "tile_keyboard": ("Tastatur", "Keyboard", "Tastiera", "Clavier", "Teclado"),
     "brightness":    ("Helligkeit", "Brightness", "Luminosità", "Luminosité", "Brillo"),
     "volume":        ("Lautstärke", "Volume", "Volume", "Volume", "Volumen"),
+    "mute_tip":      ("Ton stummschalten oder aktivieren", "Mute or unmute audio", "Silenzia o riattiva l'audio", "Couper ou rétablir le son", "Silenciar o activar el sonido"),
     "kbd_light":     ("Tastaturbeleuchtung", "Keyboard Backlight", "Retroilluminazione tastiera",
                       "Rétroéclairage clavier", "Retroiluminación del teclado"),
     "battery":       ("Akku", "Battery", "Batteria", "Batterie", "Batería"),
@@ -627,6 +691,8 @@ STR = {
     "det_cycles":    ("Ladezyklen: {n}", "Charge cycles: {n}", "Cicli di carica: {n}",
                       "Cycles de charge : {n}", "Ciclos de carga: {n}"),
     "media_default": ("Wiedergabe", "Now Playing", "In riproduzione", "Lecture en cours", "Reproduciendo"),
+    "media_idle": ("Keine Wiedergabe", "Nothing Playing", "Nessuna riproduzione", "Aucune lecture", "Sin reproducción"),
+    "media_idle_help": ("Wiedergabe startet hier", "Start playback to see controls", "Avvia la riproduzione per vedere i controlli", "Lancez une lecture pour afficher les commandes", "Inicia la reproducción para ver los controles"),
     "media_thumbnail_help": ("Aktuelle Wiedergabe mit Vorschaubild und Fortschritt", "Now playing with thumbnail and progress", "Riproduzione con miniatura e avanzamento", "Lecture avec vignette et progression", "Reproducción con miniatura y progreso"),
     "pp_saver":      ("Sparen", "Saver", "Risparmio", "Économie", "Ahorro"),
     "pp_balanced":   ("Ausgewogen", "Balanced", "Bilanciato", "Équilibré", "Equilibrado"),
@@ -635,10 +701,9 @@ STR = {
     "show_devices":  ("Geräte anzeigen", "Show devices", "Mostra dispositivi", "Afficher les appareils", "Mostrar dispositivos"),
     "show_vpn":      ("VPN-Profile anzeigen", "Show VPN profiles", "Mostra profili VPN",
                       "Afficher les profils VPN", "Mostrar perfiles VPN"),
-    "head_wifi":     ("WLAN-Netzwerke", "Wi-Fi networks", "Reti Wi-Fi", "Réseaux Wi-Fi", "Redes Wi-Fi"),
-    "head_bt":       ("Bluetooth-Geräte", "Bluetooth devices", "Dispositivi Bluetooth",
-                      "Appareils Bluetooth", "Dispositivos Bluetooth"),
-    "head_vpn":      ("VPN-Profile", "VPN profiles", "Profili VPN", "Profils VPN", "Perfiles VPN"),
+    "head_wifi":     ("WLAN", "Wi-Fi", "Wi-Fi", "Wi-Fi", "Wi-Fi"),
+    "head_bt":       ("Bluetooth", "Bluetooth", "Bluetooth", "Bluetooth", "Bluetooth"),
+    "head_vpn":      ("VPN", "VPN", "VPN", "VPN", "VPN"),
     "wifi_off":      ("WLAN ist ausgeschaltet", "Wi-Fi is off", "Il Wi-Fi è disattivato",
                       "Le Wi-Fi est désactivé", "El Wi-Fi está desactivado"),
     "bt_off":        ("Bluetooth ist ausgeschaltet", "Bluetooth is off", "Il Bluetooth è disattivato",
@@ -675,6 +740,7 @@ STR = {
                       "Girar la pantalla (0° → 90° → 180° → 270°)"),
     "tip_out":       ("Audio-Ausgabe wechseln", "Switch audio output", "Cambia uscita audio",
                       "Changer la sortie audio", "Cambiar salida de audio"),
+    "single_output": ("Nur ein Ausgabegerät", "Only one output device", "Un solo dispositivo di uscita", "Un seul périphérique de sortie", "Solo hay una salida de audio"),
     "tip_out_now":   ("Ausgabe: {d}\nKlick wechselt das Gerät", "Output: {d}\nClick to switch device",
                       "Uscita: {d}\nClicca per cambiare dispositivo", "Sortie : {d}\nCliquer pour changer d'appareil",
                       "Salida: {d}\nHaz clic para cambiar de dispositivo"),
@@ -689,8 +755,12 @@ STR = {
     "quick_terminal": ("Terminal", "Terminal", "Terminale", "Terminal", "Terminal"),
     "quick_clipboard": ("Zwischenablage", "Clipboard history", "Cronologia appunti", "Historique du presse-papiers", "Historial del portapapeles"),
     "quick_network": ("Netzwerk", "Network settings", "Impostazioni rete", "Paramètres réseau", "Ajustes de red"),
+    "detail_network": ("Netzwerk", "Network", "Rete", "Réseau", "Red"),
     "quick_bluetooth": ("Bluetooth-Geräte", "Bluetooth devices", "Dispositivi Bluetooth", "Appareils Bluetooth", "Dispositivos Bluetooth"),
     "quick_sound": ("Audio", "Sound settings", "Impostazioni audio", "Paramètres audio", "Ajustes de sonido"),
+    "detail_sound": ("Audio", "Sound", "Audio", "Son", "Sonido"),
+    "sound_more": ("Weitere Audioeinstellungen", "More sound settings", "Altre impostazioni audio", "Plus de réglages audio", "Más ajustes de sonido"),
+    "back": ("Zurück", "Back", "Indietro", "Retour", "Atrás"),
     "quick_power_settings": ("Energieeinstellungen", "Power settings", "Impostazioni energia", "Paramètres d’alimentation", "Ajustes de energía"),
     "quick_keyboard": ("Tastatur", "Keyboard settings", "Impostazioni tastiera", "Paramètres clavier", "Ajustes de teclado"),
     "quick_mouse": ("Maus & Touchpad", "Mouse & touchpad", "Mouse e touchpad", "Souris et pavé tactile", "Ratón y panel táctil"),
@@ -735,12 +805,33 @@ STR = {
     "theme_setting": ("Design: {v}", "Theme: {v}", "Tema: {v}", "Thème : {v}", "Tema: {v}"),
     "theme_midnight": ("Mitternacht", "Midnight", "Mezzanotte", "Minuit", "Medianoche"),
     "theme_graphite": ("Graphit", "Graphite", "Grafite", "Graphite", "Grafito"),
+    "theme_frosted": ("Frosted Dark", "Frosted Dark", "Frosted Dark", "Sombre givré", "Oscuro esmerilado"),
     "theme_light": ("Hell", "Light", "Chiaro", "Clair", "Claro"),
     "accent_setting": ("Akzentfarbe: {v}", "Accent color: {v}", "Colore accento: {v}", "Couleur d’accent : {v}", "Color de acento: {v}"),
     "accent_blue": ("Blau", "Blue", "Blu", "Bleu", "Azul"),
     "accent_purple": ("Violett", "Purple", "Viola", "Violet", "Morado"),
     "accent_teal": ("Türkis", "Teal", "Verde acqua", "Sarcelle", "Verde azulado"),
     "accent_pink": ("Pink", "Pink", "Rosa", "Rose", "Rosa"),
+    "accent_red": ("Rot", "Red", "Rosso", "Rouge", "Rojo"),
+    "accent_orange": ("Orange", "Orange", "Arancione", "Orange", "Naranja"),
+    "accent_yellow": ("Gelb", "Yellow", "Giallo", "Jaune", "Amarillo"),
+    "accent_green": ("Grün", "Green", "Verde", "Vert", "Verde"),
+    "accent_graphite": ("Graphit", "Graphite", "Grafite", "Graphite", "Grafito"),
+    "setting_theme": ("Darstellung", "Appearance", "Aspetto", "Apparence", "Apariencia"),
+    "setting_accent": ("Akzentfarbe", "Accent color", "Colore accento", "Couleur d’accent", "Color de acento"),
+    "setting_language": ("Sprache", "Language", "Lingua", "Langue", "Idioma"),
+    "setting_animations": ("Animationen reduzieren", "Reduce motion", "Riduci movimento", "Réduire les animations", "Reducir movimiento"),
+    "setting_animation_speed": ("Animationsgeschwindigkeit", "Animation speed", "Velocità animazioni", "Vitesse des animations", "Velocidad de animación"),
+    "setting_focus_close": ("Bei Fokusverlust schließen", "Close when focus is lost", "Chiudi quando perde il focus", "Fermer si la fenêtre perd le focus", "Cerrar al perder el foco"),
+    "setting_quick_actions": ("Schnellaktionen", "Quick Actions", "Azioni rapide", "Actions rapides", "Acciones rápidas"),
+    "setting_compact": ("Kompakte Schnellaktionen", "Compact quick actions", "Azioni rapide compatte", "Actions rapides compactes", "Acciones rápidas compactas"),
+    "setting_media_card": ("Medienkarte", "Media card", "Scheda multimediale", "Carte multimédia", "Tarjeta multimedia"),
+    "setting_media_art": ("Cover und Artwork", "Artwork", "Copertine", "Pochettes", "Carátulas"),
+    "setting_refresh": ("Aktualisierung", "Refresh interval", "Intervallo di aggiornamento", "Fréquence d’actualisation", "Intervalo de actualización"),
+    "setting_resource": ("Ressourcenprofil", "Resource profile", "Profilo risorse", "Profil de ressources", "Perfil de recursos"),
+    "setting_diagnostics": ("Diagnose", "Diagnostics", "Diagnostica", "Diagnostic", "Diagnóstico"),
+    "media_card_on": ("Einblenden", "Show", "Mostra", "Afficher", "Mostrar"),
+    "media_card_off": ("Ausblenden", "Hide", "Nascondi", "Masquer", "Ocultar"),
     "language_setting": ("Sprache: {v}", "Language: {v}", "Lingua: {v}", "Langue : {v}", "Idioma: {v}"),
     "language_auto": ("Automatisch", "Automatic", "Automatico", "Automatique", "Automático"),
     "language_de": ("Deutsch", "German", "Tedesco", "Allemand", "Alemán"),
@@ -760,6 +851,11 @@ STR = {
     "kbd_bright": ("Tastaturlicht heller", "Keyboard light brighter", "Luce tastiera più intensa", "Rétroéclairage plus fort", "Luz del teclado más intensa"),
     "kbd_cycle_tip": ("Klicken: Aus → An → Heller", "Click: Off → On → Brighter", "Clic: spento → acceso → più forte", "Clic : éteint → allumé → plus fort", "Clic: apagado → encendido → más brillo"),
     "network_current": ("Aktuelle Verbindung", "Current connection", "Connessione attuale", "Connexion actuelle", "Conexión actual"),
+    "network_unavailable": ("Keine Verbindungsdetails verfügbar", "Connection details unavailable", "Dettagli di connessione non disponibili", "Détails de connexion indisponibles", "Detalles de conexión no disponibles"),
+    "network_device_label": ("Gerät", "Device", "Dispositivo", "Appareil", "Dispositivo"),
+    "network_ip_label": ("IP-Adresse", "IP address", "Indirizzo IP", "Adresse IP", "Dirección IP"),
+    "network_gateway_label": ("Gateway", "Gateway", "Gateway", "Passerelle", "Puerta de enlace"),
+    "network_dns_label": ("DNS", "DNS", "DNS", "DNS", "DNS"),
     "network_ip": ("IP-Adresse: {v}", "IP address: {v}", "Indirizzo IP: {v}", "Adresse IP : {v}", "Dirección IP: {v}"),
     "network_gateway": ("Gateway: {v}", "Gateway: {v}", "Gateway: {v}", "Passerelle : {v}", "Puerta de enlace: {v}"),
     "network_dns": ("DNS: {v}", "DNS: {v}", "DNS: {v}", "DNS : {v}", "DNS: {v}"),
@@ -890,8 +986,8 @@ STR = {
                   "Falló la conexión VPN"),
     'search_actions': ('Aktion suchen …', 'Search actions …', 'Cerca azioni …', 'Rechercher une action …', 'Buscar acciones …'),
     'all': ('Alle', 'All', 'Tutte', 'Tout', 'Todas'),
-    'connections': ('Verbindungen', 'Connections', 'Connessioni', 'Connexions', 'Conexiones'),
-    'tools': ('Werkzeuge', 'Tools', 'Strumenti', 'Outils', 'Herramientas'),
+    'connections': ('Netz', 'Network', 'Rete', 'Réseau', 'Red'),
+    'tools': ('Werkzeuge', 'Tools', 'Strumenti', 'Outils', 'Utilidades'),
     'device': ('Gerät', 'Device', 'Dispositivo', 'Appareil', 'Dispositivo'),
     'more_actions': ('Alle Aktionen', 'All actions', 'Tutte le azioni', 'Toutes les actions', 'Todas las acciones'),
     'less_actions': ('Kompakte Ansicht', 'Compact view', 'Vista compatta', 'Vue compacte', 'Vista compacta'),
@@ -1159,28 +1255,188 @@ def battery_icon_name(cap, st):
 
 
 # ── Lautstärke / Audio ──
-def volume_pct():
-    m = re.search(r"(\d+)%", sh("pactl", "get-sink-volume", "@DEFAULT_SINK@"))
-    return min(int(m.group(1)), 100) if m else 50
+def volume_pct(backend=None):
+    value = shc("pactl", "get-sink-volume", "@DEFAULT_SINK@") if backend != "wpctl" else ""
+    m = re.search(r"(\d+)%", value)
+    if m:
+        return min(int(m.group(1)), 100)
+    value = shc("wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@")
+    m = re.search(r"Volume:\s*(\d+(?:\.\d+)?)", value)
+    return min(round(float(m.group(1)) * 100), 100) if m else 50
 
 
-def sink_muted():
-    return "yes" in shc("pactl", "get-sink-mute", "@DEFAULT_SINK@")
+def sink_muted(backend=None):
+    value = shc("pactl", "get-sink-mute", "@DEFAULT_SINK@").lower() if backend != "wpctl" else ""
+    if "yes" in value or "no" in value:
+        return "yes" in value
+    return "[muted]" in shc("wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@").lower()
 
 
-def mic_muted():
-    return "yes" in shc("pactl", "get-source-mute", "@DEFAULT_SOURCE@")
+def mic_muted(backend=None):
+    value = shc("pactl", "get-source-mute", "@DEFAULT_SOURCE@").lower() if backend != "wpctl" else ""
+    if "yes" in value or "no" in value:
+        return "yes" in value
+    return "[muted]" in shc("wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@").lower()
 
 
 def sinks():
-    # ([(name, beschreibung)], standard-name)
+    """Return an explicit discovery result; PulseAudio works over PipeWire too."""
+    return discover_audio_outputs()
+
+
+def _command_result(command, timeout=4, runner=subprocess.run):
+    started = time.monotonic()
+    environment = {**os.environ, "LC_ALL": "C"}
+    if any(arg.startswith("--diagnose") for arg in sys.argv[1:]) and command[0] == "pactl":
+        # An explicit socket prevents libpulse autospawn during read-only probes.
+        environment.setdefault("PULSE_SERVER", "unix:" + os.path.join(
+            os.environ.get("XDG_RUNTIME_DIR", "/run/user/" + str(os.getuid())), "pulse/native"))
+        environment.setdefault("PULSE_CLIENTCONFIG", "/dev/null")
+        environment.setdefault("PULSE_RUNTIME_PATH", os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+        cookie = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "pulse/cookie")
+        environment.setdefault("PULSE_COOKIE", cookie if os.path.isfile(cookie) else "/dev/null")
+        if environment["PULSE_CLIENTCONFIG"] != "/dev/null":
+            environment["XDG_CONFIG_HOME"] = os.path.dirname(environment["PULSE_CLIENTCONFIG"])
     try:
-        data = json.loads(shc("pactl", "--format=json", "list", "sinks") or "[]")
-    except ValueError:
-        data = []
-    rows = [(s.get("name", ""), s.get("description") or s.get("name", ""))
-            for s in data if isinstance(s, dict) and s.get("name")]
-    return rows, shc("pactl", "get-default-sink")
+        result = runner(command, capture_output=True, text=True, timeout=timeout,
+                        env=environment)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logging.warning("backend=%s operation=%s duration=%.3fs error=%s",
+                        command[0], command[1], time.monotonic() - started,
+                        type(exc).__name__)
+        raise
+    if result.returncode:
+        # Only hardware tools: never log command arguments containing credentials.
+        detail = re.sub(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", "[adapter]",
+                        result.stderr or "")[:500] if command[0] in ("bluetoothctl", "rfkill") else ""
+        logging.warning("backend=%s operation=%s duration=%.3fs exit=%s stderr=%s",
+                        command[0], command[1], time.monotonic() - started,
+                        result.returncode, detail)
+    return result
+
+
+def discover_audio_outputs(runner=subprocess.run, available=which):
+    """Find real output devices via pipewire-pulse/pactl, then native PipeWire."""
+    tools = [tool for tool in ("pactl", "wpctl") if available(tool)]
+    if not tools:
+        return {"status": "unavailable", "devices": [], "default": "", "backend": ""}
+    timed_out = False
+    errors = []
+    empty_result = None
+    for tool in tools:
+        try:
+            if tool == "pactl":
+                result = _command_result([tool, "--format=json", "list", "sinks"], runner=runner)
+                if result.returncode:
+                    errors.append((result.stderr or result.stdout or "pactl failed").strip())
+                    continue
+                data = json.loads(result.stdout or "[]")
+                if not isinstance(data, list):
+                    raise ValueError("invalid sink list")
+                if any(not isinstance(row, dict) or not isinstance(row.get("name"), str)
+                       or not row["name"] for row in data):
+                    raise ValueError("invalid sink entry")
+                devices = [{"id": row["name"], "name": row["name"],
+                            "description": row.get("description") or row["name"],
+                            "backend": "pactl"}
+                           for row in data if isinstance(row, dict) and row.get("name")]
+                default_result = _command_result([tool, "get-default-sink"], runner=runner)
+                default = default_result.stdout.strip() if default_result.returncode == 0 else ""
+                value = {"status": "ready" if devices else "empty", "devices": devices,
+                         "default": default, "backend": "pactl", "server": ""}
+                if devices:
+                    if not default or default not in {device["id"] for device in devices}:
+                        errors.append("pactl could not identify the default output")
+                        continue
+                    value["server"] = "PulseAudio-compatible"
+                    try:
+                        info = _command_result([tool, "info"], timeout=2, runner=runner)
+                        match = re.search(r"^Server Name:\s*(.+)$", info.stdout, re.MULTILINE)
+                        if info.returncode == 0 and match:
+                            value["server"] = ("PipeWire via PulseAudio" if "pipewire" in
+                                               match.group(1).lower() else "PulseAudio")
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+                    return value
+                return value  # a working Pulse server with no sinks is authoritative
+            result = _command_result([tool, "status", "-n"], runner=runner)
+            if result.returncode:
+                errors.append((result.stderr or result.stdout or "wpctl failed").strip())
+                continue
+            in_sinks = False
+            devices = []
+            default = ""
+            for line in result.stdout.splitlines():
+                if re.search(r"\bSinks:\s*$", line):
+                    in_sinks = True
+                    continue
+                if in_sinks and re.search(r"\b(?:Devices|Sources|Filters|Streams):\s*$", line):
+                    break
+                if not in_sinks:
+                    continue
+                match = re.search(r"(\*)?\s*(\d+)\.\s+(.+?)(?:\s+\[.*\])?\s*$", line)
+                if match:
+                    marker, device_id, name = match.groups()
+                    devices.append({"id": device_id, "name": name, "description": name,
+                                    "backend": "wpctl"})
+                    if marker == "*":
+                        default = device_id
+            if not in_sinks:
+                raise ValueError("wpctl output has no Sinks section")
+            value = {"status": "ready" if devices else "empty", "devices": devices,
+                     "default": default, "backend": "wpctl", "server": "PipeWire"}
+            if devices:
+                if default in {device["id"] for device in devices}:
+                    return value
+                errors.append("wpctl could not identify the default output")
+                continue
+            empty_result = value
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            errors.append(str(exc))
+    if timed_out:
+        status = "timeout"
+    elif empty_result is not None:
+        return empty_result
+    elif errors and all(any(marker in error.lower() for marker in
+                            ("connection refused", "could not connect", "cannot connect",
+                             "server not running", "no such file or directory", "no pipewire"))
+                        for error in errors):
+        status = "backend_unavailable"
+    else:
+        status = "error"
+    return {"status": status, "devices": [], "default": "", "backend": "",
+            "detail": errors[-1] if errors else ""}
+
+
+def set_audio_output(device, runner=subprocess.run):
+    """Switch and verify a discovered output; no optimistic state change."""
+    command = (["pactl", "set-default-sink", device["id"]] if device["backend"] == "pactl"
+               else ["wpctl", "set-default", device["id"]])
+    try:
+        result = _command_result(command, runner=runner)
+        if result.returncode:
+            return False
+        if device["backend"] == "pactl":
+            inputs = _command_result(["pactl", "list", "short", "sink-inputs"], runner=runner)
+            if inputs.returncode == 0:
+                deadline = time.monotonic() + 2.0
+                for line in inputs.stdout.splitlines():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    fields = line.split()
+                    if fields and fields[0].isdigit():
+                        try:
+                            _command_result(["pactl", "move-sink-input", fields[0], device["id"]],
+                                            timeout=remaining, runner=runner)
+                        except (OSError, subprocess.TimeoutExpired):
+                            break  # default selection is verified independently below
+        verified = discover_audio_outputs(runner=runner, available=lambda name: name == device["backend"])
+        return verified["status"] == "ready" and verified["default"] == device["id"]
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 # ── Netzwerk ──
@@ -1377,7 +1633,129 @@ def nm_connect_new_wifi(ssid, password, timeout=35):
 
 # ── Bluetooth ──
 def bt_on():
-    return "Powered: yes" in sh("bluetoothctl", "show")
+    return bluetooth_state()["powered"] is True
+
+
+def _bluetooth_error_status(message):
+    text = (message or "").lower()
+    if any(word in text for word in ("not authorized", "notauthorized", "permission denied", "access denied", "operation not permitted")):
+        return "permission"
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    if any(word in text for word in ("serviceunknown", "namehasnoowner", "connection refused", "failed to connect", "org.bluez not available")):
+        return "service"
+    return "error"
+
+
+def bluetooth_state(runner=subprocess.run):
+    """Read adapter state without assuming a successful bluetoothctl process."""
+    if not which("bluetoothctl"):
+        return {"status": "unavailable", "powered": None}
+    try:
+        listed = _command_result(["bluetoothctl", "list"], timeout=5, runner=runner)
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "powered": None}
+    except OSError as exc:
+        return {"status": _bluetooth_error_status(str(exc)), "powered": None}
+    if listed.returncode or not re.search(r"Controller\s+[0-9A-Fa-f:]{17}", listed.stdout):
+        message = listed.stderr or listed.stdout
+        if not listed.returncode and not message.strip():
+            if which("gdbus"):
+                try:
+                    owner = _command_result(["gdbus", "call", "--system", "--dest",
+                        "org.freedesktop.DBus", "--object-path", "/org/freedesktop/DBus",
+                        "--method", "org.freedesktop.DBus.NameHasOwner", "org.bluez"],
+                        timeout=2, runner=runner)
+                    if owner.returncode == 0 and "false" in owner.stdout:
+                        return {"status": "service", "powered": None}
+                except (OSError, subprocess.TimeoutExpired):
+                    pass  # owner unknown; do not misreport a missing service
+            return {"status": "adapter_unavailable", "powered": None}
+        status = _bluetooth_error_status(message)
+        return {"status": status, "powered": None}
+    try:
+        shown = _command_result(["bluetoothctl", "show"], timeout=5, runner=runner)
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "powered": None}
+    except OSError as exc:
+        return {"status": _bluetooth_error_status(str(exc)), "powered": None}
+    if shown.returncode:
+        return {"status": _bluetooth_error_status(shown.stderr or shown.stdout), "powered": None}
+    match = re.search(r"^\s*Powered:\s*(yes|no)\s*$", shown.stdout, re.MULTILINE | re.IGNORECASE)
+    if not match:
+        return {"status": "adapter_unavailable", "powered": None}
+    return {"status": "ready", "powered": match.group(1).lower() == "yes"}
+
+
+def bluetooth_set_power(enabled, runner=subprocess.run):
+    """Request BlueZ power, unblock only a soft block, then verify real state."""
+    current = bluetooth_state(runner=runner)
+    logging.info("Bluetooth backend=bluetoothctl operation=power target=%s state=%s powered_before=%s",
+                 enabled, current["status"], current["powered"])
+    if current["status"] != "ready" and not (enabled and current["status"] == "adapter_unavailable"):
+        return current
+    def failed(status):
+        observed = bluetooth_state(runner=runner)
+        actual = observed.get("powered") if observed.get("status") == "ready" else current["powered"]
+        return {"status": status, "powered": actual}
+    if current["powered"] is bool(enabled):
+        return current
+    if enabled and which("rfkill"):
+        try:
+            blocked = _command_result(["rfkill", "list", "bluetooth"], timeout=3, runner=runner)
+            if blocked.returncode == 0:
+                text = blocked.stdout.lower()
+                logging.info("Bluetooth rfkill soft_blocked=%s hard_blocked=%s",
+                             bool(re.search(r"soft blocked:\s*yes", text)),
+                             bool(re.search(r"hard blocked:\s*yes", text)))
+                if re.search(r"hard blocked:\s*yes", text):
+                    return {"status": "blocked", "powered": False}
+                if re.search(r"soft blocked:\s*yes", text):
+                    unblocked = _command_result(["rfkill", "unblock", "bluetooth"], timeout=3, runner=runner)
+                    if unblocked.returncode:
+                        status = _bluetooth_error_status(unblocked.stderr or unblocked.stdout)
+                        return failed("permission" if status == "error" else status)
+                    # A platform rfkill switch may hide the controller entirely.
+                    # Unblocking must precede adapter discovery in that case.
+                    if current["status"] == "adapter_unavailable":
+                        # BlueZ processes the rfkill uevent asynchronously.
+                        for attempt in range(4):
+                            current = bluetooth_state(runner=runner)
+                            if current["status"] != "adapter_unavailable":
+                                break
+                            if attempt < 3:
+                                time.sleep(0.15)
+        except subprocess.TimeoutExpired:
+            return {"status": "timeout", "powered": False}
+        except OSError as exc:
+            return {"status": _bluetooth_error_status(str(exc)), "powered": False}
+    if current["status"] != "ready":
+        return current
+    try:
+        action = _command_result(["bluetoothctl", "power", "on" if enabled else "off"],
+                                 timeout=8, runner=runner)
+    except subprocess.TimeoutExpired:
+        return failed("timeout")
+    except OSError as exc:
+        return {"status": _bluetooth_error_status(str(exc)), "powered": current["powered"]}
+    if action.returncode or re.search(r"failed|not available|notready|notauthorized", action.stdout, re.I):
+        status = _bluetooth_error_status(action.stderr or action.stdout)
+        logging.warning("Bluetooth power command failed: exit=%s status=%s detail=%s",
+                        action.returncode, status,
+                        re.sub(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", "[adapter]",
+                               action.stderr or action.stdout)[:500])
+        return failed("permission" if status == "error" and "permission" in
+                      (action.stderr + action.stdout).lower() else status)
+    verified = bluetooth_state(runner=runner)
+    logging.info("Bluetooth power readback: status=%s powered_after=%s",
+                 verified["status"], verified["powered"])
+    if verified["status"] != "ready":
+        return verified
+    if verified["powered"] is not bool(enabled):
+        logging.warning("Bluetooth power verification failed: before=%s requested=%s after=%s",
+                        current["powered"], enabled, verified["powered"])
+        return {"status": "error", "powered": verified["powered"]}
+    return verified
 
 
 def bt_devices():
@@ -1404,7 +1782,7 @@ def bt_devices():
 
 # ── Night Shift / Wach halten / Flugmodus ──
 def nightshift_on():
-    return subprocess.run(["pgrep", "-x", "gammastep"], capture_output=True).returncode == 0
+    return subprocess.run(["pgrep", "-x", "gammastep"], capture_output=True, timeout=2).returncode == 0
 
 
 # Hilfsprozess "Wach halten": hält Inhibits für Bildschirmschoner und
@@ -1439,7 +1817,7 @@ def wake_set(on):
                              start_new_session=True, stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
-        subprocess.run(["pkill", "-f", WAKE_PATTERN])
+        subprocess.run(["pkill", "-f", WAKE_PATTERN], timeout=2)
 
 
 def airplane_on():
@@ -1576,14 +1954,9 @@ def discover_tiles():
         out, angle = screen_rotation()
         return {"rot": (out, angle)} if out else {}
 
-    def audio():
-        rows, current = sinks()
-        return {"out": (rows, current)} if len(rows) > 1 else {}
-
     jobs = []
     for enabled, func in ((which("gdbus") or which("powerprofilesctl"), power),
                           (which("xinput"), inputs), (which("xrandr"), rotation),
-                          (which("pactl"), audio),
                           (which("xfconf-query"), lambda: {"dnd": notification_dnd_state()})):
         if enabled:
             jobs.append(func)
@@ -1695,8 +2068,9 @@ SVGS = {
 SVG_CACHE = {}
 
 
-def svg_image(name, size=18, color="#ffffff"):
+def svg_image(name, size=18, color=None):
     from gi.repository import GdkPixbuf
+    color = color or _inactive_icon_color()
     key = (name, size, color)
     if key in SVG_CACHE:
         return Gtk.Image.new_from_pixbuf(SVG_CACHE[key])
@@ -1713,15 +2087,74 @@ def svg_image(name, size=18, color="#ffffff"):
 
 
 # ══════════════════════════ Stylesheet ══════════════════════════
+UI_TOKENS = {
+    "background": "#0e1118", "surface": "#1a1f29", "surface_secondary": "#242a35",
+    "surface_active": "#0d2d4f", "text": "#ffffff", "text_secondary": "#a7afbf",
+    "accent": "#0a84ff", "warning_error": "#ff453a",
+    "icon_small": 16, "icon_action": 18, "icon_brand": 24,
+    "radius_card": "16px", "radius_control": "12px",
+    "padding_card": "12px", "section_gap": "10px", "control_height": "36px",
+}
+
+THEME_TOKENS = {
+    "midnight": {"window_background": "#0e1118", "card_surface": "#1a1f29",
+                 "elevated_surface": "#202630", "secondary_surface": "#242a35",
+                 "border_separator": "#303744", "primary_text": "#ffffff", "secondary_text": "#a7afbf",
+                 "disabled_text": "#6d7481", "hover": "#303744", "pressed": "#3a4352",
+                 "active_surface": "#173e66", "slider_background": "#303744", "slider_thumb": "#f5f6fa",
+                 "accent_treatment": "#0a84ff", "focus_treatment": "#0a84ff",
+                 "destructive": "#ff6961", "warning": "#ffb340"},
+    "graphite": {"window_background": "#1d1d20", "card_surface": "#25252a",
+                 "elevated_surface": "#2a2a30", "secondary_surface": "#2f2f35",
+                 "border_separator": "#3c3c43", "primary_text": "#f5f5f7", "secondary_text": "#a1a1a8",
+                 "disabled_text": "#707078", "hover": "#38383f", "pressed": "#45454e",
+                 "active_surface": "#3a4b62", "slider_background": "#414149", "slider_thumb": "#f5f6fa",
+                 "accent_treatment": "#0a84ff", "focus_treatment": "#0a84ff",
+                 "destructive": "#ff6961", "warning": "#ffb340"},
+    "frosted": {"window_background": "#151a22", "card_surface": "#202732",
+                "elevated_surface": "#27303c", "secondary_surface": "#2c3543",
+                "border_separator": "#394555", "primary_text": "#f7f8fa", "secondary_text": "#b0bac8",
+                "disabled_text": "#778291", "hover": "#354151", "pressed": "#414f61",
+                "active_surface": "#24496d", "slider_background": "#394555", "slider_thumb": "#f5f6fa",
+                "accent_treatment": "#0a84ff", "focus_treatment": "#0a84ff",
+                "destructive": "#ff827b", "warning": "#ffc266"},
+    "light": {"window_background": "#f3f5f9", "card_surface": "#ffffff",
+              "elevated_surface": "#f1f3f7", "secondary_surface": "#e9edf3",
+              "border_separator": "#d8dde6", "primary_text": "#182033", "secondary_text": "#596273",
+              "disabled_text": "#9299a6", "hover": "#e6eaf0", "pressed": "#d9dfe8",
+              "active_surface": "#d7e9fc", "slider_background": "#dce1e8", "slider_thumb": "#ffffff",
+              "accent_treatment": "#0a84ff", "focus_treatment": "#0a84ff",
+              "destructive": "#b42318", "warning": "#8a5200"},
+}
+
+
+def _inactive_icon_color():
+    theme = CFG.get("theme", "midnight")
+    return THEME_TOKENS.get(theme, THEME_TOKENS["midnight"])["primary_text"]
+
+
+def _ui_px(name):
+    return int(UI_TOKENS[name].replace("px", ""))
+
+
 CSS = f"""
-.selected-category {{ background-color: rgba(10,132,255,0.20); border-radius: 8px; }}
-.workspace {{ padding: 18px; background-color: rgba(14,17,24,0.985); }}
+.selected-category {{ background-color: {UI_TOKENS['surface_active']}; border-radius: 999px; }}
+.category-bar {{ background-color: {UI_TOKENS['surface_secondary']}; border-radius: 999px; padding: 3px; }}
+.category-button, .category-button:hover, .category-button:active, .category-button:focus {{
+    background-image: none; border: none; box-shadow: none; border-radius: 999px;
+    min-height: 28px; padding: 3px 8px; color: {UI_TOKENS['text_secondary']}; }}
+.category-button:hover {{ background-color: rgba(255,255,255,0.08); }}
+.category-button:active {{ background-color: rgba(255,255,255,0.16); }}
+.category-button.selected-category {{ color: {UI_TOKENS['text']}; }}
+.category-button label {{ color: {UI_TOKENS['text_secondary']}; font-size: 10px; }}
+.category-button.selected-category label {{ color: {UI_TOKENS['text']}; }}
+.workspace {{ padding: {UI_TOKENS['padding_card']}; background-color: {UI_TOKENS['background']}; }}
 .workspace label {{ color: #ffffff; }}
 .workspace entry {{ min-height: 28px; }}
-#root {{ background-color: rgba(14,17,24,0.985); border-radius: 20px;
-         border: 1px solid rgba(255,255,255,0.12); padding: 12px; }}
+#root {{ background-color: {UI_TOKENS['background']}; border-radius: {UI_TOKENS['radius_card']};
+         border: 1px solid rgba(255,255,255,0.10); padding: {UI_TOKENS['padding_card']}; }}
 #app-header {{ padding: 2px 1px 11px 1px; border-bottom: 1px solid rgba(255,255,255,0.09); }}
-#brand-mark {{ background-image: linear-gradient(to bottom right, #0a84ff, #6554d9);
+#brand-mark {{ background-image: linear-gradient(to bottom right, {UI_TOKENS['accent']}, #6554d9);
          border-radius: 13px; min-width: 42px; min-height: 42px; }}
 .header-title {{ color: #ffffff; font-family: "SF Pro Display","Inter",sans-serif;
          font-size: 15px; font-weight: 700; }}
@@ -1736,68 +2169,98 @@ CSS = f"""
          border-radius: 999px; min-width: 28px; min-height: 28px; padding: 0;
          background-color: rgba(255,255,255,0.075); }}
 .header-close:hover {{ background-color: rgba(255,69,58,0.8); }}
-#content-scroll, #content-scroll viewport {{ background-color: rgba(14,17,24,0.985); border: none; }}
-#content-scroll scrollbar {{ background-color: rgba(14,17,24,0.985); margin: 3px; }}
+#content-scroll, #content-scroll viewport {{ background-color: {UI_TOKENS['background']}; border: none; }}
+#content-scroll scrollbar {{ background-color: {UI_TOKENS['background']}; margin: 3px; }}
 #content-scroll scrollbar slider {{ background-color: rgba(255,255,255,0.25);
          border-radius: 7px; min-width: 5px; min-height: 28px; }}
 #content-scroll scrollbar slider:hover {{ background-color: rgba(255,255,255,0.42); }}
-.module {{ background-color: rgba(255,255,255,0.052); border-radius: 12px;
+.module {{ background-color: {UI_TOKENS['surface']}; border-radius: {UI_TOKENS['radius_card']};
          border: 1px solid rgba(255,255,255,0.065); }}
-.module.quick-tile {{ transition: background-color 150ms ease-in-out, border-color 150ms ease-in-out; }}
-.module.quick-tile:hover {{ background-color: rgba(255,255,255,0.075); border-color: rgba(255,255,255,0.11); }}
+.slider-row {{ background-color: transparent; }}
+.control-divider {{ background-color: rgba(255,255,255,0.08); min-height: 1px; margin: 0 12px; }}
+.slider-icon-button, .slider-icon-button:hover, .slider-icon-button:active {{
+    background-image: none; background-color: transparent; border: none; box-shadow: none;
+    border-radius: 8px; min-width: 28px; min-height: 28px; padding: 0; }}
+.slider-icon-button:hover {{ background-color: rgba(255,255,255,0.10); }}
+.slider-icon-button:active {{ background-color: rgba(255,255,255,0.20); }}
+.slider-icon-button:focus {{ border: 1px solid {UI_TOKENS['accent']}; }}
+.detail-key {{ color: {UI_TOKENS['text_secondary']}; font-size: 11px; }}
+.sound-row {{ min-height: 42px; }}
+switch.sound-switch {{ background-color: {UI_TOKENS['surface_secondary']}; border: 1px solid rgba(255,255,255,0.12);
+                       border-radius: 999px; min-width: 42px; min-height: 24px; padding: 1px; }}
+switch.sound-switch:checked {{ background-color: {UI_TOKENS['accent']}; border-color: {UI_TOKENS['accent']}; }}
+switch.sound-switch slider {{ background-color: #ffffff; border-radius: 999px; min-width: 20px; min-height: 20px; }}
 .toast {{ background-color: rgba(10,132,255,0.20); border: 1px solid rgba(10,132,255,0.26);
          border-radius: 10px; padding: 8px 10px; }}
 .toast label {{ color: #ffffff; font-size: 11px; }}
-.toast.error {{ background-color: rgba(255,69,58,0.20); border-color: rgba(255,69,58,0.4); }}
-.title {{ color: #ffffff; font-family: "SF Pro Text","SF Pro Display",sans-serif;
+.toast.error {{ background-color: rgba(255,69,58,0.20); border-color: {UI_TOKENS['warning_error']}; }}
+.title {{ color: {UI_TOKENS['text']}; font-family: "SF Pro Text","SF Pro Display",sans-serif;
           font-weight: 600; font-size: 13px; }}
-.subtitle {{ color: rgba(255,255,255,0.55); font-family: "SF Pro Text",sans-serif;
+.subtitle {{ color: {UI_TOKENS['text_secondary']}; font-family: "SF Pro Text",sans-serif;
              font-size: 11px; }}
 .ttitle {{ color: #ffffff; font-family: "SF Pro Text","SF Pro Display",sans-serif;
            font-weight: 600; font-size: 11px; }}
 .tsub {{ color: rgba(255,255,255,0.55); font-family: "SF Pro Text",sans-serif;
          font-size: 10px; }}
 .knob, .knob:hover, .knob:active, .knob:focus {{
-         border-radius: 999px; min-width: 36px; min-height: 36px;
+         border-radius: 999px; min-width: {UI_TOKENS['control_height']}; min-height: {UI_TOKENS['control_height']};
          background-image: none; border: 1px solid rgba(255,255,255,0.035); outline: none;
          box-shadow: none; -gtk-icon-shadow: none; padding: 0;
          background-color: rgba(255,255,255,0.105);
          transition: background-color 150ms ease-in-out, border-color 150ms ease-in-out; }}
 .knob:hover {{ background-color: rgba(255,255,255,0.18); border-color: rgba(255,255,255,0.12); }}
+.knob:active {{ background-color: rgba(255,255,255,0.24); }}
+.knob:focus {{ border: 1px solid {UI_TOKENS['accent']}; }}
+.knob:disabled, button:disabled, scale:disabled, switch:disabled {{ opacity: 0.5; }}
 .knob image {{ color: #ffffff; }}
 .knob.on, .knob.on:hover, .knob.on:active, .knob.on:focus {{
-         background-color: rgba(10,132,255,0.17); border: 1px solid rgba(10,132,255,0.48); }}
+         background-color: {UI_TOKENS['surface_active']}; border: 1px solid rgba(10,132,255,0.48); }}
+.media-control, .media-control:hover, .media-control:active {{ min-width: 28px; min-height: 28px; }}
 .knob.warn, .knob.warn:hover, .knob.warn:active, .knob.warn:focus {{
-         background-color: rgba(255,69,58,0.19); border: 1px solid rgba(255,69,58,0.6); }}
+         background-color: rgba(255,69,58,0.19); border: 1px solid {UI_TOKENS['warning_error']}; }}
 .listitem, .listitem:hover, .listitem:active, .listitem:focus {{
          background-image: none; background-color: transparent; border: none;
          outline: none; box-shadow: none; border-radius: 8px;
          padding: 5px 8px; min-height: 0; min-width: 0; }}
 .listitem:hover {{ background-color: rgba(255,255,255,0.12); }}
+.listitem:active {{ background-color: rgba(255,255,255,0.18); }}
+.listitem:focus {{ border: 1px solid rgba(10,132,255,0.48); }}
 .listitem label {{ color: #ffffff; font-size: 12px; }}
-.listitem label.danger {{ color: #ff453a; }}
+.listitem label.danger {{ color: {UI_TOKENS['warning_error']}; }}
 .chev, .chev:hover, .chev:active, .chev:focus {{
          background-image: none; background-color: transparent; border: none;
          outline: none; box-shadow: none; padding: 0; min-width: 14px; min-height: 28px; }}
 .chev image {{ color: rgba(255,255,255,0.55); }}
-.pwentry, .pwentry:focus {{ color: #ffffff; background-color: rgba(255,255,255,0.12);
-         background-image: none; border: none; box-shadow: none; border-radius: 8px;
-         padding: 6px 8px; min-height: 0; caret-color: #ffffff; }}
-.pwentry:focus {{ background-color: rgba(255,255,255,0.18); }}
-.pwmsg {{ color: #ff453a; font-size: 11px; }}
-scale trough {{ background-color: rgba(255,255,255,0.20); background-image: none;
-                border: none; border-radius: 999px; min-height: 22px;
+.chev:hover {{ background-color: rgba(255,255,255,0.08); }}
+.chev:active {{ background-color: rgba(255,255,255,0.16); }}
+.pwentry, .pwentry:focus {{ color: #ffffff; background-color: rgba(255,255,255,0.08);
+         background-image: none; border: 1px solid rgba(255,255,255,0.08); box-shadow: none; border-radius: 12px;
+         padding: 6px 12px; min-height: 32px; caret-color: #ffffff; }}
+.pwentry:focus {{ background-color: rgba(255,255,255,0.12); border-color: rgba(10,132,255,0.55); }}
+.pwmsg {{ color: {UI_TOKENS['warning_error']}; font-size: 11px; }}
+scale trough {{ background-color: rgba(255,255,255,0.18); background-image: none;
+                border: none; border-radius: 999px; min-height: 7px;
                 margin: 0; padding: 0; }}
 scale highlight {{ background-color: #ffffff; background-image: none;
                    border: none; border-radius: 999px; margin: 0; padding: 0;
-                   min-height: 22px; min-width: 22px; }}
-scale slider {{ background: none; background-color: transparent; border: none;
-                box-shadow: none; min-width: 1px; min-height: 22px;
-                margin: 0; padding: 0; opacity: 0; }}
-scale {{ padding: 0; min-height: 22px; }}
-.slider-icon {{ color: rgba(60,60,67,0.85); -gtk-icon-shadow: none; }}
-.media-cover {{ background-color: rgba(255,255,255,0.055); border: 1px solid rgba(255,255,255,0.08);
-               border-radius: 10px; padding: 1px; min-width: 88px; min-height: 50px; }}
+                   min-height: 7px; min-width: 7px; }}
+scale slider {{ background: none; background-color: #f5f6fa; border: 1px solid rgba(0,0,0,0.12);
+                box-shadow: none; min-width: 14px; min-height: 14px;
+                margin: 0; padding: 0; }}
+scale:hover slider {{ background-color: #ffffff; }}
+scale:focus slider {{ border: 2px solid {UI_TOKENS['accent']}; }}
+scale:disabled trough {{ background-color: rgba(255,255,255,0.08); }}
+scale {{ padding: 0; min-height: 20px; }}
+.slider-icon {{ color: #c6cad3; -gtk-icon-shadow: none; }}
+.page-title {{ color: #ffffff; font-size: 16px; font-weight: 600; }}
+.back-button {{ min-width: 30px; min-height: 30px; border-radius: 999px;
+                background-image: none; background-color: rgba(255,255,255,0.08);
+                border: none; box-shadow: none; }}
+.back-button:hover {{ background-color: rgba(255,255,255,0.15); }}
+.back-button:active {{ background-color: rgba(255,255,255,0.22); }}
+.back-button:focus {{ border: 1px solid {UI_TOKENS['accent']}; }}
+.media-cover {{ background-color: {UI_TOKENS['surface_secondary']}; border: 1px solid rgba(255,255,255,0.08);
+               border-radius: {UI_TOKENS['radius_control']}; padding: 1px; min-width: 56px; min-height: 56px; }}
 .media-cover image {{ border-radius: 8px; }}
 .media-cover progressbar {{ min-height: 4px; border-radius: 999px; }}
 .media-cover progressbar trough {{ min-height: 4px; background-color: rgba(255,255,255,0.12); border-radius: 999px; }}
@@ -1810,41 +2273,100 @@ scale {{ padding: 0; min-height: 22px; }}
 .kbd-step.on, .kbd-step:checked {{ background-color: rgba(10,132,255,0.17);
                border-color: rgba(10,132,255,0.48); }}
 .kbd-step image {{ color: #ffffff; }}
+.settings-group {{ background-color: {UI_TOKENS['surface']}; border: 1px solid rgba(255,255,255,0.07);
+                   border-radius: 12px; padding: 3px; }}
+.settings-section {{ color: {UI_TOKENS['text_secondary']}; font-size: 10px; font-weight: 600;
+                     padding: 2px 0 3px 0; }}
+.settings-row, .settings-row:hover, .settings-row:active, .settings-row:focus {{
+    background-image: none; border: none; box-shadow: none; outline: none;
+    border-radius: 8px; min-height: 34px; padding: 5px 8px; }}
+.settings-row:hover {{ background-color: rgba(255,255,255,0.075); }}
+.settings-row:active {{ background-color: rgba(255,255,255,0.14); }}
+.settings-row label {{ color: {UI_TOKENS['text']}; font-size: 11px; font-weight: 500; }}
+.settings-value {{ color: {UI_TOKENS['text_secondary']}; font-size: 10px; }}
+.settings-selected {{ color: {UI_TOKENS['accent']}; }}
+.settings-toggle-row {{ min-height: 36px; padding: 4px 10px; }}
+.settings-toggle-row label {{ color: {UI_TOKENS['text']}; font-size: 11px; }}
+switch.settings-switch {{ min-width: 38px; min-height: 22px; }}
+switch.settings-switch slider {{ min-width: 18px; min-height: 18px; }}
 """
 
 
-_THEME_BASE = "rgba(14,17,24,0.985)"
+_THEME_BASE = UI_TOKENS["background"]
+
+
+def _accent_for_theme(theme, accent_color):
+    color, rgb = ACCENT_PALETTE.get(accent_color, ACCENT_PALETTE["blue"])
+    if theme != "light":
+        return color, rgb
+    def luminance(values):
+        channels = [v / 255 for v in values]
+        linear = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+                  for v in channels]
+        return sum(weight * value for weight, value in zip((0.2126, 0.7152, 0.0722), linear))
+    adjusted = tuple(rgb)
+    while luminance(adjusted) > 0.30:
+        adjusted = tuple(round(channel * 0.88) for channel in adjusted)
+    return "#" + "".join(f"{channel:02x}" for channel in adjusted), adjusted
+
 
 def _theme_css(theme="midnight", accent_color="blue"):
-    """Return the compact theme stylesheet for one of the supported palettes."""
+    """Apply one complete opaque palette while preserving the shared geometry."""
     import re as _re
-    css = CSS
-    hex_color, rgb = ACCENT_PALETTE.get(accent_color, ACCENT_PALETTE["blue"])
-    css = css.replace("#0a84ff", hex_color)
+    theme = theme if theme in THEME_TOKENS else "midnight"
+    tokens = dict(THEME_TOKENS[theme])
+    hex_color, rgb = _accent_for_theme(theme, accent_color)
+    surface_rgb = tuple(int(tokens["card_surface"][i:i + 2], 16) for i in (1, 3, 5))
+    mix = 0.13 if theme == "light" else 0.22
+    tokens["active_surface"] = "#" + "".join(
+        f"{round(bg * (1 - mix) + fg * mix):02x}" for bg, fg in zip(surface_rgb, rgb))
+    tokens["accent_treatment"] = hex_color
+    tokens["focus_treatment"] = hex_color
+    css = CSS.replace(UI_TOKENS["accent"], hex_color)
     css = _re.sub(r"rgba\(10,132,255,([0-9.]+)\)",
                   lambda m: f"rgba({rgb[0]},{rgb[1]},{rgb[2]},{m.group(1)})", css)
-    if theme == "graphite":
-        css = css.replace(_THEME_BASE, "rgba(29,29,32,0.99)")
-        css = css.replace("rgba(255,255,255,0.052)", "rgba(255,255,255,0.065)")
-        css = css.replace("rgba(255,255,255,0.065); }}", "rgba(255,255,255,0.09); }}")
-    elif theme == "light":
-        css = css.replace(_THEME_BASE, "rgba(246,248,252,0.99)")
-        css = css.replace("rgba(255,255,255,0.052)", "rgba(20,30,48,0.045)")
-        css = css.replace("rgba(255,255,255,0.065)", "rgba(20,30,48,0.12)")
-        css = css.replace("rgba(255,255,255,0.12)", "rgba(20,30,48,0.12)")
-        css = css.replace("rgba(255,255,255,0.25)", "rgba(20,30,48,0.28)")
-        css = css.replace("rgba(255,255,255,0.42)", "rgba(20,30,48,0.43)")
-        css = css.replace("color: #ffffff;", "color: #182033;")
-        css = css.replace("rgba(255,255,255,0.55)", "rgba(24,32,51,0.62)")
-        css = css.replace("rgba(235,238,245,0.58)", "rgba(24,32,51,0.62)")
-        css = css.replace("rgba(255,255,255,0.78)", "rgba(24,32,51,0.82)")
-        css = css.replace("rgba(255,255,255,0.105)", "rgba(20,30,48,0.07)")
-        css = css.replace("rgba(255,255,255,0.18)", "rgba(20,30,48,0.12)")
-        css = css.replace("rgba(255,255,255,0.075)", "rgba(20,30,48,0.06)")
-        css = css.replace("rgba(255,255,255,0.16)", "rgba(20,30,48,0.09)")
-        css = css.replace("rgba(255,255,255,0.24)", "rgba(20,30,48,0.15)")
-        css = css.replace("rgba(255,255,255,0.20)", "rgba(20,30,48,0.16)")
-    return css
+    css = css.replace(UI_TOKENS["background"], tokens["window_background"])
+    css = css.replace(UI_TOKENS["surface"], tokens["card_surface"])
+    css = css.replace(UI_TOKENS["surface_secondary"], tokens["secondary_surface"])
+    css = css.replace(UI_TOKENS["surface_active"], tokens["active_surface"])
+    css = css.replace(UI_TOKENS["text_secondary"], tokens["secondary_text"])
+    overrides = f"""
+#root, #content-scroll, #content-scroll viewport {{ background-color: {tokens['window_background']}; color: {tokens['primary_text']}; }}
+#root {{ border-color: {tokens['border_separator']}; }}
+.module {{ background-color: {tokens['card_surface']}; border-color: {tokens['border_separator']}; }}
+.control-divider {{ background-color: {tokens['border_separator']}; }}
+.category-bar, .status-pill {{ background-color: {tokens['elevated_surface']}; }}
+.sound-switch, scale trough {{ background-color: {tokens['slider_background']}; }}
+#root .knob {{ background-color: {tokens['elevated_surface']}; border-color: {tokens['border_separator']}; }}
+.category-button:hover, .back-button:hover, .chev:hover, .listitem:hover, .knob:hover {{ background-color: {tokens['hover']}; }}
+.category-button:active, .back-button:active, .chev:active, .listitem:active, .knob:active {{ background-color: {tokens['pressed']}; }}
+#root .knob:hover {{ background-color: {tokens['hover']}; }}
+#root .knob:active {{ background-color: {tokens['pressed']}; }}
+#root .knob.on, #root .knob.on:hover, #root .knob.on:active, #root .selected-category {{ background-color: {tokens['active_surface']}; border-color: {hex_color}; }}
+#root label {{ color: {tokens['primary_text']}; }}
+#root label.title, #root label.ttitle, #root label.page-title, #root label.header-title,
+#root .listitem label, #root .knob image, #root .kbd-step image {{ color: {tokens['primary_text']}; }}
+#root label.subtitle, #root label.tsub, #root label.header-subtitle, #root label.detail-key,
+#root label.version-pill, #root .slider-icon, #root label.settings-section,
+ #root label.settings-value {{ color: {tokens['secondary_text']}; }}
+#root label:disabled, #root .subtitle:disabled {{ color: {tokens['disabled_text']}; }}
+#root .listitem label.danger, #root .pwmsg, #root .toast.error label {{ color: {tokens['destructive']}; }}
+#root .knob.warn {{ border-color: {tokens['warning']}; }}
+#root button:focus, #root .listitem:focus, #root .back-button:focus, #root scale:focus slider {{ border-color: {tokens['focus_treatment']}; }}
+#root .settings-row:focus {{ border: 1px solid {tokens['focus_treatment']}; }}
+#root switch {{ background-color: {tokens['slider_background']}; }}
+#root switch:checked, #root scale highlight, #root .media-cover progressbar progress {{ background-color: {hex_color}; }}
+#root scale trough, #root .media-cover progressbar trough {{ background-color: {tokens['slider_background']}; }}
+#root scale slider {{ background-color: {tokens['slider_thumb']}; border-color: {tokens['border_separator']}; }}
+.settings-group {{ background-color: {tokens['card_surface']}; border-color: {tokens['border_separator']}; }}
+.settings-row, .settings-row:hover, .settings-row:active, .settings-row:focus {{ color: {tokens['primary_text']}; }}
+.settings-row:hover {{ background-color: {tokens['hover']}; }}
+.settings-row:active {{ background-color: {tokens['pressed']}; }}
+.settings-section {{ color: {tokens['secondary_text']}; }}
+.settings-value {{ color: {tokens['secondary_text']}; }}
+#root .settings-selected {{ color: {hex_color}; }}
+"""
+    return css + overrides
 
 
 # ══════════════════════════ Fenster ══════════════════════════
@@ -1852,6 +2374,9 @@ class ControlCenter(Gtk.Window):
     POLL_SECONDS = CFG["poll_seconds"]      # Live-Aktualisierung (config.json), nur solange das Fenster offen ist
 
     def __init__(self):
+        global ACCENT
+        ACCENT = _accent_for_theme(CFG.get("theme", "midnight"),
+                                   CFG.get("accent_color", "blue"))[0]
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.set_title(T("brand_title"))
         try:
@@ -1904,10 +2429,19 @@ class ControlCenter(Gtk.Window):
         self._pp_cur, self._pp_profs = "", []
         self._rot_out = None
         self._sinks, self._sink_cur = [], ""
+        self._audio_generation = 0
+        self._audio_status = "loading"
+        self._audio_backend = ""
+        self._audio_control_backend = ""
+        self._audio_refreshing = False
+        self._bt_generation = 0
+        self._bt_pending = False
+        self._bt_last_status = "unknown"
         self._act_mode, self._act_btns = None, {}
         self._ss_delay, self._ss_mode = 0, 0
         self._confirm_key, self._confirm_lab, self._confirm_src = None, None, 0
         self._detail_mode = None
+        self._current_page = "main"
         self._pw_active, self._pw_ssid = False, ""
         self._pw_entry = self._pw_msg = self._pw_ok = None
         self._resize_debounce_id = 0
@@ -1944,9 +2478,17 @@ class ControlCenter(Gtk.Window):
         Gtk.StyleContext.add_provider_for_screen(
             screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        root.set_name("root")
-        self._content_root = root
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_ui_px("section_gap"))
+        root.set_name("main-page")
+        self._main_page = root
+        self._content_stack = Gtk.Stack()
+        self._content_stack.set_name("root")
+        self._content_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self._content_stack.set_transition_duration(self._animation_duration(150))
+        self._content_stack.set_hhomogeneous(False)
+        self._content_stack.set_vhomogeneous(False)
+        self._content_stack.add_named(root, "main")
+        self._content_root = self._content_stack
         self._content_scroll = Gtk.ScrolledWindow()
         self._content_scroll.set_name("content-scroll")
         self._content_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -1958,7 +2500,7 @@ class ControlCenter(Gtk.Window):
         self._content_scroll.set_vexpand(False)
         if hasattr(self._content_scroll, "set_overlay_scrolling"):
             self._content_scroll.set_overlay_scrolling(False)
-        self._content_scroll.add(root)
+        self._content_scroll.add(self._content_stack)
         self.add(self._content_scroll)
         # Compact command entry: search uses only already discovered actions.
         self._action_search = Gtk.SearchEntry()
@@ -1986,9 +2528,9 @@ class ControlCenter(Gtk.Window):
         # kurz nach dem Öffnen aus dem Hintergrund-Poll.
         wrap = Gtk.Box()
         wrap.get_style_context().add_class("module")
-        inner = Gtk.Grid(row_spacing=10, column_spacing=4)
+        inner = Gtk.Grid(row_spacing=8, column_spacing=8)
         for m in ("top", "bottom", "start", "end"):
-            getattr(inner, f"set_margin_{m}")(10)
+            getattr(inner, f"set_margin_{m}")(_ui_px("padding_card"))
         wrap.pack_start(inner, True, True, 0)
         wrap.set_hexpand(True)
 
@@ -1999,44 +2541,43 @@ class ControlCenter(Gtk.Window):
         if which("gammastep"):
             self.btn_ns = self._toggle("nightshift", "Night Shift", "…", False, self.on_nightshift)
         for holder, available in ((self.btn_wifi, bool(which("nmcli"))),
-                                  (self.btn_bt, bool(which("bluetoothctl")) and bool(glob.glob("/sys/class/bluetooth/hci*"))),
+                                  (self.btn_bt, bool(which("bluetoothctl"))),
                                   (self.btn_vpn, bool(which("nmcli")))):
             if not available:
                 holder[0].set_sensitive(False)
                 holder[0].set_tooltip_text(T("unavailable"))
         inner.attach(self.btn_wifi[0], 0, 0, 1, 1)
-        inner.attach(self.btn_bt[0], 0, 1, 1, 1)
-        inner.attach(self.btn_vpn[0], 0, 2, 1, 1)
+        inner.attach(self.btn_bt[0], 1, 0, 1, 1)
+        inner.attach(self.btn_vpn[0], 0, 1, 1, 1)
+        if self.btn_ns:
+            inner.attach(self.btn_ns[0], 1, 1, 1, 1)
 
-        top = Gtk.Box(spacing=10, homogeneous=bool(self.btn_ns))
+        top = Gtk.Box()
         top.pack_start(wrap, True, True, 0)
         if self.btn_ns:
-            nsmod = Gtk.Box()
-            nsmod.get_style_context().add_class("module")
-            nsrow = self.btn_ns[0]
-            nsrow.set_valign(Gtk.Align.CENTER)
-            nsrow.set_margin_start(10)
-            nsrow.set_margin_end(10)
-            nsmod.pack_start(nsrow, True, True, 0)
-            top.pack_start(nsmod, True, True, 0)
-        topwrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        topwrap.pack_start(top, False, False, 0)
-        self._build_detail(topwrap)
-        root.pack_start(topwrap, False, False, 0)
+            self.btn_ns[0].set_valign(Gtk.Align.CENTER)
+        self._build_detail(top)
+        root.pack_start(top, False, False, 0)
 
         # ── Helligkeit ──
         pct, self._bl_max = brightness_pct()
+        self.controls_mod = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.controls_mod.get_style_context().add_class("module")
         if pct is not None:
             self.bl_mod = self._slider_module(T("brightness"), "display-brightness-symbolic",
                                               pct, self.on_brightness)
-            root.pack_start(self.bl_mod, False, False, 0)
+            self.controls_mod.pack_start(self.bl_mod, False, False, 0)
+            divider = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+            divider.get_style_context().add_class("control-divider")
+            self.controls_mod.pack_start(divider, False, False, 0)
 
         # ── Lautstärke (Klick aufs Icon = stumm) ──
         self.vol_mod = self._slider_module(T("volume"), "audio-volume-high-symbolic",
                                            50, self.on_volume)
-        root.pack_start(self.vol_mod, False, False, 0)
-        self.vol_mod.icon_box.connect("button-press-event", self.on_mute)
-        if not which("pactl"):
+        self.controls_mod.pack_start(self.vol_mod, False, False, 0)
+        root.pack_start(self.controls_mod, False, False, 0)
+        self.vol_mod.icon_box.connect("clicked", self.on_mute)
+        if not (which("pactl") or which("wpctl")):
             self.vol_mod.set_sensitive(False)
             self.vol_mod.set_tooltip_text(T("unavailable"))
 
@@ -2090,6 +2631,7 @@ class ControlCenter(Gtk.Window):
         # Start: Fenster ist sofort sichtbar, Daten kommen im Hintergrund.
         GLib.timeout_add(100, self._tick_once)
         self._poll_source = GLib.timeout_add_seconds(self.POLL_SECONDS, self._tick)
+        self._refresh_audio_outputs()
         self._rescan_devices()
 
     # ══════════════════ Bausteine ══════════════════
@@ -2108,7 +2650,7 @@ class ControlCenter(Gtk.Window):
         mark.set_name("brand-mark")
         mark.set_visible_window(True)
         mark.set_tooltip_text(T("brand_title"))
-        mark.add(svg_image("controlcenter", 24))
+        mark.add(svg_image("controlcenter", 24, color="#ffffff"))
         try:
             mark.get_accessible().set_name(T("brand_title"))
         except Exception:
@@ -2184,7 +2726,8 @@ class ControlCenter(Gtk.Window):
         btn.get_style_context().add_class("knob")
         if active:
             btn.get_style_context().add_class("on")
-        btn.set_image(svg_image(icon, color=(ACCENT if active else "#ffffff")))
+        btn.set_image(svg_image(icon, size=UI_TOKENS["icon_action"],
+                                color=(ACCENT if active else _inactive_icon_color())))
         self._toggle_icons[id(btn)] = icon
         btn.set_always_show_image(True)
         btn.connect("clicked", cb)
@@ -2210,35 +2753,54 @@ class ControlCenter(Gtk.Window):
 
     def _slider_module(self, title, icon, value, cb):
         wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        wrap.get_style_context().add_class("module")
+        wrap.get_style_context().add_class("slider-row")
         inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         for m in ("top", "bottom", "start", "end"):
-            getattr(inner, f"set_margin_{m}")(10)
+            getattr(inner, f"set_margin_{m}")(8 if m in ("top", "bottom") else 12)
+        title_row = Gtk.Box()
         lab = Gtk.Label(label=title, xalign=0)
         lab.get_style_context().add_class("title")
+        title_row.pack_start(lab, True, True, 0)
+        if title == T("volume"):
+            detail = Gtk.Button.new_from_icon_name("go-next-symbolic", Gtk.IconSize.MENU)
+            detail.get_style_context().add_class("chev")
+            detail.set_relief(Gtk.ReliefStyle.NONE)
+            detail.set_tooltip_text(T("quick_sound"))
+            detail.connect("clicked", lambda *_: self._detail_toggle("sound"))
+            title_row.pack_end(detail, False, False, 0)
         sc = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
         sc.set_draw_value(False)
         sc.set_value(value)          # vor dem connect: set_value darf den Callback nicht auslösen
         sc.set_hexpand(True)
         sc.connect("value-changed", cb)
-        # Icon links IM Regler (Overlay); das Icon ist klickbar (EventBox)
-        ov = Gtk.Overlay()
-        ov.add(sc)
+        # Icon is a separate leading control, so it never obscures the slider fill.
         img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.MENU)
         img.get_style_context().add_class("slider-icon")
-        img.set_margin_start(3)
-        evb = Gtk.EventBox()
-        evb.set_visible_window(False)
-        evb.set_halign(Gtk.Align.START)
-        evb.set_valign(Gtk.Align.CENTER)
-        evb.add(img)
-        ov.add_overlay(evb)
-        inner.pack_start(lab, False, False, 0)
-        inner.pack_start(ov, False, False, 0)
+        if title == T("volume"):
+            icon_box = Gtk.Button()
+            icon_box.get_style_context().add_class("slider-icon-button")
+            icon_box.set_relief(Gtk.ReliefStyle.NONE)
+            icon_box.set_tooltip_text(T("mute_tip"))
+            icon_box.set_image(img)
+            try:
+                icon_box.get_accessible().set_name(T("mute_tip"))
+            except Exception:
+                pass
+        else:
+            icon_box = Gtk.Box()
+            icon_box.set_size_request(24, 24)
+            icon_box.set_halign(Gtk.Align.CENTER)
+            icon_box.set_valign(Gtk.Align.CENTER)
+            icon_box.pack_start(img, True, True, 0)
+        control_row = Gtk.Box(spacing=8)
+        control_row.pack_start(icon_box, False, False, 0)
+        control_row.pack_start(sc, True, True, 0)
+        inner.pack_start(title_row, False, False, 0)
+        inner.pack_start(control_row, False, False, 0)
         wrap.pack_start(inner, True, True, 0)
         wrap.scale = sc
         wrap.icon = img
-        wrap.icon_box = evb
+        wrap.icon_box = icon_box
         return wrap
 
     def _available_popup_height(self):
@@ -2414,11 +2976,14 @@ class ControlCenter(Gtk.Window):
         ctx.add_class("on") if on else ctx.remove_class("on")
         icon_name = getattr(self, "_toggle_icons", {}).get(id(button))
         if icon_name:
-            image = svg_image(icon_name, color=(ACCENT if on else "#ffffff"))
+            image = svg_image(icon_name, size=UI_TOKENS["icon_action"],
+                              color=(ACCENT if on else _inactive_icon_color()))
             button.set_image(image)
             image.show()
 
     def _toast(self, message, error=False, timeout_ms=2600):
+        if not error and not CFG.get("feedback", True):
+            return
         if not hasattr(self, "_toast_label"):
             return
         if self._toast_src:
@@ -2654,33 +3219,79 @@ class ControlCenter(Gtk.Window):
         self._busy_for("wifi", 2500)
 
     def on_bt(self, b):
-        if "bt" not in self._st:
-            self._tick_once()
-            self._toast(T("working"))
+        if self._bt_pending:
             return
-        on = not self._st["bt"]
-        subprocess.Popen(["bluetoothctl", "power", "on" if on else "off"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self._st["bt"] = on
-        self._flip(self.btn_bt, on)
-        self.btn_bt[2].set_text(T("on") if on else T("off"))
-        self._busy_for("bt", 2500)
+        self._bt_pending = True
+        self._bt_generation += 1
+        generation = self._bt_generation
+        target = not self._st.get("bt", False)
+        self.btn_bt[0].set_sensitive(False)
+        self.btn_bt[2].set_text(T("connecting"))
+        threading.Thread(target=self._bt_worker, args=(generation, target), daemon=True).start()
+
+    def _bt_worker(self, generation, target):
+        try:
+            result = bluetooth_set_power(target)
+        except Exception:
+            logging.exception("Bluetooth power worker failed")
+            result = {"status": "error", "powered": None}
+        GLib.idle_add(self._bt_apply_result, generation, target, result)
+
+    def _bt_apply_result(self, generation, target, result):
+        if generation != self._bt_generation or self._destroyed:
+            return False
+        self._bt_pending = False
+        self._bt_generation += 1  # invalidate polls begun while the action was running
+        state = result.get("powered")
+        self._bt_last_status = result.get("status", "error")
+        status = result.get("status")
+        if state is not None:
+            self._st["bt"] = state
+            self._flip(self.btn_bt, state)
+            self.btn_bt[2].set_text(T("on") if state else T("off"))
+        else:
+            self.btn_bt[2].set_text(T("on") if self._st.get("bt", False) else T("off"))
+        self.btn_bt[0].set_sensitive(bool(which("bluetoothctl")))
+        if status == "ready" and state is target:
+            self._toast(T("on") if target else T("off"), timeout_ms=1100)
+        else:
+            message = {"adapter_unavailable": "bt_adapter_missing", "blocked": "bt_blocked",
+                       "permission": "bt_permission", "service": "bt_service",
+                       "timeout": "bt_timeout"}.get(status, "bt_power_error")
+            self._toast(T(message), error=True)
+        return False
 
     def on_nightshift(self, b):
-        if not which("gammastep"):
+        if not which("gammastep") or self._busy.get("ns"):
             return
-        on = not (self._st["ns"] if "ns" in self._st else nightshift_on())
-        if on:
-            subprocess.Popen(["gammastep"], start_new_session=True, stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._busy["ns"] = True
+        threading.Thread(target=self._nightshift_worker, daemon=True).start()
+
+    def _nightshift_worker(self):
+        actual = None
+        try:
+            if nightshift_on():
+                _command_result(["pkill", "-x", "gammastep"], timeout=2)
+                _command_result(["gammastep", "-x"], timeout=3)
+            else:
+                subprocess.Popen(["gammastep"], start_new_session=True, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            actual = nightshift_on()
+        except (OSError, subprocess.TimeoutExpired):
+            logging.warning("Night Shift command failed or timed out")
+        GLib.idle_add(self._nightshift_done, actual)
+
+    def _nightshift_done(self, actual):
+        if self._destroyed:
+            return False
+        self._busy["ns"] = False
+        if actual is None:
+            self._toast(T("settings_failed"), error=True)
         else:
-            subprocess.run(["pkill", "-x", "gammastep"])
-            subprocess.Popen(["gammastep", "-x"], start_new_session=True, stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  # Farben sofort zurücksetzen
-        self._st["ns"] = on
-        self._flip(self.btn_ns, on)
-        self.btn_ns[2].set_text(T("active") if on else T("off"))
-        self._busy_for("ns", 2500)
+            self._st["ns"] = actual
+            self._flip(self.btn_ns, actual)
+            self.btn_ns[2].set_text(T("active") if actual else T("off"))
+        return False
 
     # ══════════════════ VPN ══════════════════
     def _vpn_apply(self, v):
@@ -2740,6 +3351,8 @@ class ControlCenter(Gtk.Window):
         GLib.idle_add(self._vpn_done, vpn_state(), ok)
 
     def _vpn_done(self, v, ok=True):
+        if self._destroyed:
+            return False
         self._busy["vpn"] = False
         self._last.pop("vpn", None)
         self._vpn_apply(v)
@@ -2765,68 +3378,262 @@ class ControlCenter(Gtk.Window):
             b.set_image(Gtk.Image.new_from_icon_name(chev_icon, Gtk.IconSize.MENU))
             b.set_always_show_image(True)
             b.set_tooltip_text(tip)
+            try:
+                b.get_accessible().set_name(tip)
+            except Exception:
+                pass
             b.set_valign(Gtk.Align.CENTER)
             b.connect("clicked", lambda _b, md=mode: self._detail_toggle(md))
             holder[0].set_spacing(6)
             holder[0].pack_end(b, False, False, 0)
+        network_button = Gtk.Button.new_from_icon_name("network-wired-symbolic", Gtk.IconSize.MENU)
+        network_button.get_style_context().add_class("chev")
+        network_button.set_relief(Gtk.ReliefStyle.NONE)
+        network_button.set_tooltip_text(T("quick_network"))
+        try:
+            network_button.get_accessible().set_name(T("quick_network"))
+        except Exception:
+            pass
+        network_button.connect("clicked", lambda *_: self._detail_toggle("network"))
+        self.btn_wifi[0].pack_end(network_button, False, False, 0)
 
-        self._detail_rev = Gtk.Revealer()
-        self._detail_rev.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
-        self._detail_rev.set_transition_duration(self._animation_duration(160))
+        self._detail_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_ui_px("section_gap"))
+        nav = Gtk.Box(spacing=8)
+        back = Gtk.Button(label=T("back"))
+        back.set_image(Gtk.Image.new_from_icon_name("go-previous-symbolic", Gtk.IconSize.MENU))
+        back.set_always_show_image(True)
+        back.get_style_context().add_class("back-button")
+        back.set_relief(Gtk.ReliefStyle.NONE)
+        back.set_tooltip_text(T("back"))
+        back.connect("clicked", lambda *_: self._navigate_page("main"))
+        self._detail_head = Gtk.Label(xalign=0)
+        self._detail_head.get_style_context().add_class("page-title")
+        nav.pack_start(back, False, False, 0)
+        nav.pack_start(self._detail_head, True, True, 0)
+        self._detail_page.pack_start(nav, False, False, 0)
         mod = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         mod.get_style_context().add_class("module")
-        mod.set_margin_top(10)
         inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         for m in ("top", "bottom", "start", "end"):
-            getattr(inner, f"set_margin_{m}")(10)
-        self._detail_head = Gtk.Label(xalign=0)
-        self._detail_head.get_style_context().add_class("title")
+            getattr(inner, f"set_margin_{m}")(_ui_px("padding_card"))
         self._detail_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        inner.pack_start(self._detail_head, False, False, 0)
         inner.pack_start(self._detail_list, False, False, 0)
         mod.pack_start(inner, True, True, 0)
-        self._detail_rev.add(mod)
-        parent.pack_start(self._detail_rev, False, False, 0)
+        self._detail_page.pack_start(mod, False, False, 0)
+        self._content_stack.add_named(self._detail_page, "detail")
+        self._sound_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_ui_px("section_gap"))
+        sound_nav = Gtk.Box(spacing=8)
+        sound_back = Gtk.Button(label=T("back"))
+        sound_back.set_image(Gtk.Image.new_from_icon_name("go-previous-symbolic", Gtk.IconSize.MENU))
+        sound_back.set_always_show_image(True)
+        sound_back.get_style_context().add_class("back-button")
+        sound_back.set_relief(Gtk.ReliefStyle.NONE)
+        sound_back.set_tooltip_text(T("back"))
+        sound_back.connect("clicked", lambda *_: self._navigate_page("main"))
+        sound_title = Gtk.Label(label=T("detail_sound"), xalign=0)
+        sound_title.get_style_context().add_class("page-title")
+        sound_nav.pack_start(sound_back, False, False, 0)
+        sound_nav.pack_start(sound_title, True, True, 0)
+        self._sound_page.pack_start(sound_nav, False, False, 0)
+        sound_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        sound_card.get_style_context().add_class("module")
+        sound_card.set_border_width(_ui_px("padding_card"))
+        sound_heading = Gtk.Box()
+        sound_label = Gtk.Label(label=T("volume"), xalign=0)
+        sound_label.get_style_context().add_class("ttitle")
+        sound_heading.pack_start(sound_label, True, True, 0)
+        self._sound_mute_button = Gtk.Button()
+        self._sound_mute_button.get_style_context().add_class("slider-icon-button")
+        self._sound_mute_icon = Gtk.Image.new_from_icon_name("audio-volume-high-symbolic", Gtk.IconSize.MENU)
+        self._sound_mute_button.set_image(self._sound_mute_icon)
+        self._sound_mute_button.set_tooltip_text(T("mute_tip"))
+        self._sound_mute_button.connect("clicked", self.on_mute)
+        try:
+            self._sound_mute_button.get_accessible().set_name(T("mute_tip"))
+        except Exception:
+            pass
+        self._sound_mute_button.set_sensitive(bool(which("pactl") or which("wpctl")))
+        sound_heading.pack_end(self._sound_mute_button, False, False, 0)
+        self._sound_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        self._sound_scale.set_draw_value(False)
+        self._sound_scale.set_value(50)
+        self._sound_scale.connect("value-changed", self.on_volume)
+        self._sound_scale.set_sensitive(bool(which("pactl") or which("wpctl")))
+        sound_card.pack_start(sound_heading, False, False, 0)
+        sound_card.pack_start(self._sound_scale, False, False, 0)
+        divider = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        divider.get_style_context().add_class("control-divider")
+        sound_card.pack_start(divider, False, False, 4)
+        output_row = Gtk.Box(spacing=10)
+        output_row.get_style_context().add_class("sound-row")
+        output_row.pack_start(svg_image("speaker", UI_TOKENS["icon_action"]), False, False, 0)
+        output_labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        output_title = Gtk.Label(label=T("tile_output"), xalign=0)
+        output_title.get_style_context().add_class("title")
+        self._sound_output = Gtk.Label(label=T("loading"), xalign=0)
+        self._sound_output.get_style_context().add_class("subtitle")
+        self._sound_output.set_ellipsize(3)
+        self._sound_output.set_max_width_chars(24)
+        if not (which("pactl") or which("wpctl")):
+            self._sound_output.set_text(T("unavailable"))
+        output_labels.pack_start(output_title, False, False, 0)
+        output_labels.pack_start(self._sound_output, False, False, 0)
+        output_row.pack_start(output_labels, True, True, 0)
+        self._sound_output_button = Gtk.Button.new_from_icon_name("go-next-symbolic", Gtk.IconSize.MENU)
+        self._sound_output_button.get_style_context().add_class("chev")
+        try:
+            self._sound_output_button.get_accessible().set_name(T("tip_out"))
+        except Exception:
+            pass
+        self._sound_output_button.connect("clicked", lambda *_: self._out_click())
+        self._sound_output_button.set_sensitive(False)
+        self._sound_output_button.set_tooltip_text(T("unavailable"))
+        output_row.pack_end(self._sound_output_button, False, False, 0)
+        sound_card.pack_start(output_row, False, False, 0)
+        input_row = Gtk.Box(spacing=10)
+        input_row.get_style_context().add_class("sound-row")
+        input_row.pack_start(svg_image("mic", UI_TOKENS["icon_action"]), False, False, 0)
+        input_labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        input_title = Gtk.Label(label=T("tile_mic"), xalign=0)
+        input_title.get_style_context().add_class("title")
+        self._sound_input = Gtk.Label(label=T("loading"), xalign=0)
+        self._sound_input.get_style_context().add_class("subtitle")
+        input_labels.pack_start(input_title, False, False, 0)
+        input_labels.pack_start(self._sound_input, False, False, 0)
+        input_row.pack_start(input_labels, True, True, 0)
+        self._sound_mic_switch = Gtk.Switch()
+        self._sound_mic_switch.get_style_context().add_class("sound-switch")
+        self._sound_mic_switch.set_active(not self._st.get("mic", False))
+        try:
+            self._sound_mic_switch.get_accessible().set_name(T("tile_mic"))
+            self._sound_mic_switch.get_accessible().set_description(T("tip_mic"))
+        except Exception:
+            pass
+        self._sound_mic_switch.connect("state-set", self._sound_input_changed)
+        input_row.pack_end(self._sound_mic_switch, False, False, 0)
+        sound_card.pack_start(input_row, False, False, 0)
+        divider = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        divider.get_style_context().add_class("control-divider")
+        sound_card.pack_start(divider, False, False, 4)
+        if not (which("pactl") or which("wpctl")):
+            self._sound_mic_switch.set_sensitive(False)
+            self._sound_input.set_text(T("unavailable"))
+        open_sound = Gtk.Button(label=T("sound_more"))
+        open_sound.get_style_context().add_class("listitem")
+        open_sound.set_image(Gtk.Image.new_from_icon_name("go-next-symbolic", Gtk.IconSize.MENU))
+        open_sound.set_always_show_image(True)
+        sound_command = next((cmd for candidate in _settings_candidates("sound_settings")
+                             for cmd in (candidate,) if which(cmd[0])), None)
+        if sound_command:
+            open_sound.connect("clicked", lambda *_: self._launch(sound_command))
+        else:
+            open_sound.set_sensitive(False)
+            open_sound.set_tooltip_text(T("unavailable"))
+        sound_card.pack_start(open_sound, False, False, 0)
+        self._sound_page.pack_start(sound_card, False, False, 0)
+        self._content_stack.add_named(self._sound_page, "sound")
+        self._network_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=_ui_px("section_gap"))
+        network_nav = Gtk.Box(spacing=8)
+        network_back = Gtk.Button(label=T("back"))
+        network_back.set_image(Gtk.Image.new_from_icon_name("go-previous-symbolic", Gtk.IconSize.MENU))
+        network_back.set_always_show_image(True)
+        network_back.get_style_context().add_class("back-button")
+        network_back.set_relief(Gtk.ReliefStyle.NONE)
+        network_back.set_tooltip_text(T("back"))
+        network_back.connect("clicked", lambda *_: self._navigate_page("main"))
+        network_title = Gtk.Label(label=T("detail_network"), xalign=0)
+        network_title.get_style_context().add_class("page-title")
+        network_nav.pack_start(network_back, False, False, 0)
+        network_nav.pack_start(network_title, True, True, 0)
+        self._network_page.pack_start(network_nav, False, False, 0)
+        self._network_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        network_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        network_card.get_style_context().add_class("module")
+        network_card.set_border_width(_ui_px("padding_card"))
+        network_card.pack_start(self._network_list, False, False, 0)
+        self._network_page.pack_start(network_card, False, False, 0)
+        self._content_stack.add_named(self._network_page, "network")
 
     _DETAIL_HEAD = {"wifi": T("head_wifi"), "bt": T("head_bt"), "vpn": T("head_vpn")}
 
+    def _navigate_page(self, page):
+        if getattr(self, "_pw_active", False):
+            self._pw_close()
+        self._detail_generation = getattr(self, "_detail_generation", 0) + 1
+        self._current_page = page
+        self._content_stack.set_visible_child_name(page)
+        self._schedule_dynamic_resize(45)
+        return False
+
     def _detail_toggle(self, mode):
-        if self._detail_rev.get_reveal_child() and self._detail_mode == mode:
-            self._detail_rev.set_reveal_child(False)
-            self._detail_mode = None
-            GLib.timeout_add(220, self._shrink)
+        if mode == "sound":
+            self._navigate_page("sound")
+            return
+        if mode == "network":
+            self._detail_mode = mode
+            for child in self._network_list.get_children():
+                self._network_list.remove(child)
+            self._network_list.pack_start(Gtk.Label(label=T("loading"), xalign=0), False, False, 0)
+            self._network_list.show_all()
+            self._navigate_page("network")
+            self._detail_reload()
             return
         self._detail_mode = mode
         self._detail_head.set_text(self._DETAIL_HEAD[mode])
         self._detail_set_msg(T("loading"))
-        self._detail_rev.set_transition_duration(self._animation_duration(160))
-        self._detail_rev.set_reveal_child(True)
+        self._navigate_page("detail")
         self._schedule_dynamic_resize(185)
         self._detail_reload()
 
     def _detail_reload(self):
-        if self._detail_mode:
-            threading.Thread(target=self._detail_worker, args=(self._detail_mode,),
-                             daemon=True).start()
+        if not self._detail_mode or self._destroyed or self._current_page not in ("detail", "network"):
+            return
+        if not hasattr(self, "_detail_jobs"):
+            self._detail_jobs = set()
+        if self._detail_mode in self._detail_jobs:
+            return
+        self._detail_generation = getattr(self, "_detail_generation", 0) + 1
+        self._detail_jobs.add(self._detail_mode)
+        threading.Thread(target=self._detail_worker,
+                         args=(self._detail_mode, self._detail_generation), daemon=True).start()
 
-    def _detail_worker(self, mode):
+    def _detail_worker(self, mode, generation):
         try:
             if mode == "wifi":
                 if wifi_on():
-                    subprocess.Popen(["nmcli", "dev", "wifi", "rescan"],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    # Bound and reap the scan process; cached networks still work
+                    # when scanning is denied or another scan is in progress.
+                    try:
+                        _command_result(["nmcli", "dev", "wifi", "rescan"], timeout=5)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
                     networks = wifi_list()
                     data = {"summary": wifi_connection_summary(networks), "networks": networks}
                 else:
                     data = "off"
             elif mode == "bt":
                 data = bt_devices() if bt_on() else "off"
+            elif mode == "network":
+                data = wifi_connection_summary(wifi_list()) if wifi_on() else "off"
             else:
                 names, act = vpn_state()
                 data = [(n, n == act) for n in names]
         except Exception:
+            logging.exception("Detail discovery failed: %s", mode)
             data = []
-        GLib.idle_add(self._detail_fill, mode, data)
+        GLib.idle_add(self._detail_complete, mode, generation, data)
+
+    def _detail_complete(self, mode, generation, data):
+        self._detail_jobs.discard(mode)
+        if self._destroyed:
+            return False
+        visible = self._current_page == ("network" if mode == "network" else "detail")
+        if mode != self._detail_mode or not visible:
+            return False
+        if generation != self._detail_generation:
+            self._detail_reload()
+            return False
+        return self._detail_fill(mode, data)
 
     def _detail_clear(self):
         for c in self._detail_list.get_children():
@@ -2851,13 +3658,56 @@ class ControlCenter(Gtk.Window):
         if mark:
             ml = Gtk.Label(label=mark)
             ml.get_style_context().add_class("subtitle")
+            ml.set_ellipsize(3)
+            ml.set_max_width_chars(22)
             row.pack_end(ml, False, False, 0)
         b.add(row)
         b.connect("clicked", cb)
         return b
 
     def _detail_fill(self, mode, data):
-        if mode != self._detail_mode:
+        if self._destroyed or mode != self._detail_mode:
+            return False
+        if mode == "network":
+            for child in self._network_list.get_children():
+                self._network_list.remove(child)
+            if data == "off" or not data:
+                self._network_list.pack_start(Gtk.Label(label=T("wifi_off" if data == "off" else "network_unavailable"), xalign=0), False, False, 0)
+            else:
+                current = Gtk.Label(label=T("network_current"), xalign=0)
+                current.get_style_context().add_class("detail-key")
+                self._network_list.pack_start(current, False, False, 2)
+                if data.get("ssid"):
+                    ssid = Gtk.Label(label=data["ssid"], xalign=0)
+                    ssid.get_style_context().add_class("title")
+                    ssid.set_ellipsize(3)
+                    ssid.set_max_width_chars(34)
+                    self._network_list.pack_start(ssid, False, False, 1)
+                separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+                separator.get_style_context().add_class("control-divider")
+                self._network_list.pack_start(separator, False, False, 7)
+                fields = (("network_device", data.get("device", "")),
+                          ("network_ip", data.get("ip", "")),
+                          ("network_gateway", data.get("gateway", "")),
+                          ("network_dns", data.get("dns", "")))
+                for key, value in fields:
+                    if not value:
+                        continue
+                    row = Gtk.Box(spacing=10)
+                    row.get_style_context().add_class("network-row")
+                    label = Gtk.Label(label=T(key + "_label"), xalign=0)
+                    label.get_style_context().add_class("detail-key")
+                    label.set_size_request(72, -1)
+                    value_label = Gtk.Label(label=value, xalign=1)
+                    value_label.get_style_context().add_class("title")
+                    value_label.set_line_wrap(True)
+                    value_label.set_max_width_chars(30)
+                    value_label.set_selectable(True)
+                    row.pack_start(label, False, False, 0)
+                    row.pack_start(value_label, True, True, 0)
+                    self._network_list.pack_start(row, False, False, 5)
+            self._network_list.show_all()
+            self._schedule_dynamic_resize(45)
             return False
         if mode == "wifi" and self._pw_active:
             return False          # Passwortabfrage bleibt stehen
@@ -2884,19 +3734,15 @@ class ControlCenter(Gtk.Window):
                     current_name = Gtk.Label(label=network_summary["ssid"], xalign=0)
                     current_name.get_style_context().add_class("title")
                     self._detail_list.pack_start(current_name, False, False, 1)
-                if network_summary.get("device"):
-                    self._detail_list.pack_start(Gtk.Label(label=T("network_device", v=network_summary["device"]), xalign=0), False, False, 0)
-                if network_summary.get("ip"):
-                    self._detail_list.pack_start(Gtk.Label(label=T("network_ip", v=network_summary["ip"]), xalign=0), False, False, 0)
-                if network_summary.get("gateway"):
-                    self._detail_list.pack_start(Gtk.Label(label=T("network_gateway", v=network_summary["gateway"]), xalign=0), False, False, 0)
-                if network_summary.get("dns"):
-                    self._detail_list.pack_start(Gtk.Label(label=T("network_dns", v=network_summary["dns"]), xalign=0), False, False, 0)
                 if network_summary.get("signal"):
                     meta = T("network_meta", signal=network_summary["signal"], security=network_summary.get("security", ""))
                     status = Gtk.Label(label=meta, xalign=0)
                     status.get_style_context().add_class("subtitle")
                     self._detail_list.pack_start(status, False, False, 2)
+                network_button = Gtk.Button(label=T("quick_network"))
+                network_button.get_style_context().add_class("listitem")
+                network_button.connect("clicked", lambda *_: self._detail_toggle("network"))
+                self._detail_list.pack_start(network_button, False, False, 3)
                 separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
                 self._detail_list.pack_start(separator, False, False, 5)
             if not data:
@@ -2904,7 +3750,7 @@ class ControlCenter(Gtk.Window):
                 empty.get_style_context().add_class("subtitle")
                 self._detail_list.pack_start(empty, False, False, 2)
             for ssid, inuse, sig, sec in data:
-                mark = ("✓  " if inuse else "") + T("network_meta", signal=sig, security=sec or "Open")
+                mark = ((T("connected") + " · ") if inuse else "") + T("network_meta", signal=sig, security=sec or "Open")
                 self._detail_list.pack_start(
                     self._detail_item(ssid, mark, lambda _b, s=ssid, sc=sec: self._wifi_connect(s, sc)),
                     False, False, 0)
@@ -2960,7 +3806,12 @@ class ControlCenter(Gtk.Window):
         GLib.idle_add(self._wifi_done, ssid, status)
 
     def _wifi_done(self, ssid, status):
+        if self._destroyed:
+            return False
         if status == "need_password":
+            if self._current_page != "detail" or self._detail_mode != "wifi":
+                self._busy["wifi"] = False
+                return False
             self._wifi_prompt(ssid)       # busy bleibt, bis die Eingabe beendet ist
             return False
         self._busy["wifi"] = False
@@ -3026,7 +3877,6 @@ class ControlCenter(Gtk.Window):
             self._detail_list.pack_start(w, False, False, 0)
         self._pw_entry, self._pw_msg = entry, msg
         self._detail_list.show_all()
-        self._detail_rev.set_reveal_child(True)
         entry.grab_focus()
 
     def _pw_toggle_visible(self, entry, pos, ev):
@@ -3048,6 +3898,7 @@ class ControlCenter(Gtk.Window):
             self._pw_ok.set_sensitive(on)
 
     def _pw_close(self):
+        self._pw_generation = getattr(self, "_pw_generation", 0) + 1
         if self._pw_entry is not None:
             self._pw_entry.set_text("")
         self._pw_active = False
@@ -3070,14 +3921,18 @@ class ControlCenter(Gtk.Window):
         self._pw_entry.set_text("")           # Passwort sofort aus dem Widget entfernen
         self._pw_set_sensitive(False)
         self._pw_msg.set_text(T("connecting"))
-        threading.Thread(target=self._pw_worker, args=(self._pw_ssid, pw), daemon=True).start()
+        self._pw_generation = getattr(self, "_pw_generation", 0) + 1
+        threading.Thread(target=self._pw_worker,
+                         args=(self._pw_ssid, pw, self._pw_generation), daemon=True).start()
 
-    def _pw_worker(self, ssid, pw):
+    def _pw_worker(self, ssid, pw, generation):
         status = nm_connect_new_wifi(ssid, pw)
         pw = None
-        GLib.idle_add(self._pw_done, ssid, status)
+        GLib.idle_add(self._pw_done, ssid, status, generation)
 
-    def _pw_done(self, ssid, status):
+    def _pw_done(self, ssid, status, generation):
+        if self._destroyed or generation != self._pw_generation or ssid != self._pw_ssid:
+            return False
         if not self._pw_active:               # inzwischen abgebrochen
             return False
         if status == "ok":
@@ -3095,9 +3950,9 @@ class ControlCenter(Gtk.Window):
     def _bt_toggle(self, mac, connected):
         self.btn_bt[2].set_text(T("disconnecting") if connected else T("connecting"))
         self._busy["bt"] = True
-        threading.Thread(target=self._bt_worker, args=(mac, connected), daemon=True).start()
+        threading.Thread(target=self._bt_device_worker, args=(mac, connected), daemon=True).start()
 
-    def _bt_worker(self, mac, connected):
+    def _bt_device_worker(self, mac, connected):
         ok = False
         try:
             r = subprocess.run(
@@ -3109,6 +3964,8 @@ class ControlCenter(Gtk.Window):
         GLib.idle_add(self._bt_done, ok)
 
     def _bt_done(self, ok=True):
+        if self._destroyed:
+            return False
         self._busy["bt"] = False
         self._last.pop("bt", None)
         if ok:
@@ -3170,12 +4027,21 @@ class ControlCenter(Gtk.Window):
         self._refresh_volume_icon()
         self._debounced("vol", self._apply_volume, round(scale.get_value()))
 
+    def _audio_control_command(self, pulse_args, pipewire_args):
+        if self._audio_control_backend == "wpctl" or not which("pactl"):
+            return ["wpctl"] + pipewire_args
+        return ["pactl"] + pulse_args
+
     def _apply_volume(self, pct):
         if self._muted:
             self._muted = False
-            subprocess.Popen(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"])
+            subprocess.Popen(self._audio_control_command(
+                ["set-sink-mute", "@DEFAULT_SINK@", "0"],
+                ["set-mute", "@DEFAULT_AUDIO_SINK@", "0"]))
             self._refresh_volume_icon()
-        subprocess.Popen(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{pct}%"])
+        subprocess.Popen(self._audio_control_command(
+            ["set-sink-volume", "@DEFAULT_SINK@", f"{pct}%"],
+            ["set-volume", "@DEFAULT_AUDIO_SINK@", f"{pct}%"]))
 
     def _refresh_volume_icon(self):
         v = self.vol_mod.scale.get_value()
@@ -3188,14 +4054,18 @@ class ControlCenter(Gtk.Window):
         else:
             n = "audio-volume-high-symbolic"
         self.vol_mod.icon.set_from_icon_name(n, Gtk.IconSize.MENU)
+        if hasattr(self, "_sound_mute_icon"):
+            self._sound_mute_icon.set_from_icon_name(n, Gtk.IconSize.MENU)
 
-    def on_mute(self, w, ev):
-        if ev.button != 1:
+    def on_mute(self, w, ev=None):
+        if ev is not None and getattr(ev, "button", 1) != 1:
             return False
         self._muted = not self._muted
         self._hold_sliders()
-        subprocess.Popen(["pactl", "set-sink-mute", "@DEFAULT_SINK@",
-                          "1" if self._muted else "0"])
+        value = "1" if self._muted else "0"
+        subprocess.Popen(self._audio_control_command(
+            ["set-sink-mute", "@DEFAULT_SINK@", value],
+            ["set-mute", "@DEFAULT_AUDIO_SINK@", value]))
         self._refresh_volume_icon()
         return True
 
@@ -3257,6 +4127,8 @@ class ControlCenter(Gtk.Window):
             GLib.idle_add(self._kbd_level_done, level, str(exc)[:180])
 
     def _kbd_level_done(self, level, error):
+        if self._destroyed:
+            return False
         self._busy["kbd_light"] = False
         self._last.pop("t:kbd_light", None)
         if error:
@@ -3277,10 +4149,10 @@ class ControlCenter(Gtk.Window):
         box.get_style_context().add_class("module")
         pad = Gtk.Box(spacing=8)
         for m in ("top", "bottom", "start", "end"):
-            getattr(pad, f"set_margin_{m}")(10)
+            getattr(pad, f"set_margin_{m}")(8)
         cover = Gtk.Frame()
         cover.get_style_context().add_class("media-cover")
-        cover.set_size_request(88, 50)
+        cover.set_size_request(56, 56)
         cover.set_tooltip_text(T("media_thumbnail_help"))
         self._m_cover = Gtk.Image.new_from_icon_name("video-x-generic-symbolic", Gtk.IconSize.DIALOG)
         self._m_cover.set_pixel_size(34)
@@ -3301,33 +4173,41 @@ class ControlCenter(Gtk.Window):
         progress_row = Gtk.Box(spacing=6)
         self._m_progress = Gtk.ProgressBar()
         self._m_progress.set_fraction(0.0)
-        self._m_progress.set_size_request(90, 4)
+        self._m_progress.set_size_request(65, 4)
         self._m_progress.set_valign(Gtk.Align.CENTER)
         self._m_time = Gtk.Label(label="", xalign=1)
         self._m_time.get_style_context().add_class("subtitle")
-        self._m_time.set_max_width_chars(13)
+        self._m_time.set_max_width_chars(8)
         progress_row.pack_start(self._m_progress, True, True, 0)
         progress_row.pack_end(self._m_time, False, False, 0)
+        self._m_progress_row = progress_row
         vb.pack_start(progress_row, False, False, 2)
         pad.pack_start(vb, True, True, 0)
+        self._media_controls = []
         for icon, tip, cmd in (("media-skip-backward-symbolic", T("prev"), "previous"),
                                ("media-playback-start-symbolic", T("play_pause"), "play-pause"),
                                ("media-skip-forward-symbolic", T("next"), "next")):
             b = Gtk.Button()
             b.get_style_context().add_class("knob")
+            b.get_style_context().add_class("media-control")
             img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.MENU)
             b.set_image(img)
             b.set_always_show_image(True)
             b.set_tooltip_text(tip)
             b.set_valign(Gtk.Align.CENTER)
             b.connect("clicked", lambda _b, c=cmd: self._player(c))
+            b.set_sensitive(False)
             if cmd == "play-pause":
                 self._m_play_img = img
+            self._media_controls.append(b)
             pad.pack_start(b, False, False, 0)
         box.pack_start(pad, True, True, 0)
         box.show_all()
-        box.set_no_show_all(True)      # Sichtbarkeit steuern wir selbst
-        box.set_visible(False)
+        progress_row.set_no_show_all(True)
+        progress_row.hide()
+        if not CFG.get("media_card", True):
+            box.set_no_show_all(True)
+            box.hide()
         parent.pack_start(box, False, False, 0)
         self._media_box = box
 
@@ -3335,15 +4215,38 @@ class ControlCenter(Gtk.Window):
         box = self._media_box
         if box is None:
             return
+        hidden = not CFG.get("media_card", True) or (info is None and CFG.get("media_hide_idle", False))
+        was_visible = box.get_visible()
+        box.set_no_show_all(hidden)
+        if hidden:
+            box.hide()
+            if was_visible:
+                self._schedule_dynamic_resize(185)
+            return
+        box.show()
+        if not was_visible:
+            self._schedule_dynamic_resize(185)
         if info is None:
-            if box.get_visible():
-                box.set_visible(False)
-                self._shrink()
+            had_progress = self._m_progress_row.get_visible()
+            self._m_title.set_text(T("media_idle"))
+            self._m_artist.set_text(T("media_idle_help"))
+            self._m_time.set_text("")
+            self._m_progress.set_fraction(0.0)
+            self._m_progress_row.hide()
+            self._m_play_img.set_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.MENU)
+            for button in self._media_controls:
+                button.set_sensitive(False)
             self._m_art_url = None
             self._m_art_generation += 1
             self._reset_media_cover()
+            if had_progress:
+                self._schedule_dynamic_resize(185)
             return
         title, artist, playing = info[:3]
+        was_idle = self._m_progress_row.get_visible() != CFG.get("media_progress", True)
+        self._m_progress_row.set_visible(CFG.get("media_progress", True))
+        for button in self._media_controls:
+            button.set_sensitive(True)
         art_url = info[3] if len(info) > 3 else ""
         position = info[4] if len(info) > 4 else None
         duration = info[5] if len(info) > 5 else None
@@ -3370,8 +4273,7 @@ class ControlCenter(Gtk.Window):
             self._m_art_url = None
             self._m_art_generation += 1
             self._reset_media_cover()
-        if not box.get_visible():
-            box.set_visible(True)
+        if was_idle:
             self._schedule_dynamic_resize(185)
 
     @staticmethod
@@ -3408,13 +4310,13 @@ class ControlCenter(Gtk.Window):
                 data = b""
             if data and len(data) <= 4 * 1024 * 1024:
                 loader = GdkPixbuf.PixbufLoader.new()
-                loader.set_size(88, 50)
+                loader.set_size(56, 56)
                 loader.write(data)
                 loader.close()
                 decoded = loader.get_pixbuf()
                 if decoded is not None:
-                    # Preserve image proportions and center-crop to a video thumbnail.
-                    target_w, target_h = 88, 50
+                    # Preserve image proportions and center-crop to square artwork.
+                    target_w, target_h = 56, 56
                     ratio = max(target_w / decoded.get_width(), target_h / decoded.get_height())
                     scaled = decoded.scale_simple(
                         max(target_w, int(decoded.get_width() * ratio)),
@@ -3428,7 +4330,7 @@ class ControlCenter(Gtk.Window):
         GLib.idle_add(self._media_cover_done, generation, pixbuf)
 
     def _media_cover_done(self, generation, pixbuf):
-        if generation != self._m_art_generation or not getattr(self, "_m_cover", None):
+        if self._destroyed or generation != self._m_art_generation or not getattr(self, "_m_cover", None):
             return False
         if pixbuf is not None:
             self._m_cover.set_from_pixbuf(pixbuf)
@@ -3441,11 +4343,15 @@ class ControlCenter(Gtk.Window):
         GLib.timeout_add(400, self._media_async)
 
     def _media_async(self):
+        if self._destroyed:
+            return False
         threading.Thread(target=lambda: GLib.idle_add(self._set_media_idle, media_info()),
                          daemon=True).start()
         return False
 
     def _set_media_idle(self, info):
+        if self._destroyed:
+            return False
         self._last.pop("media", None)
         self._set_media(info)
         return False
@@ -3521,7 +4427,7 @@ class ControlCenter(Gtk.Window):
         self._tile_set("dnd", on=bool(enabled), sub=T("dnd_on") if enabled else T("dnd_off"))
 
     def _dnd_click(self):
-        current = self._st.get("dnd", notification_dnd_state())
+        current = self._st.get("dnd")
         if current is None:
             if which("xfce4-notifyd-config"):
                 self._launch(["xfce4-notifyd-config"])
@@ -3544,6 +4450,8 @@ class ControlCenter(Gtk.Window):
         GLib.idle_add(self._dnd_done, target, ok, notification_dnd_state())
 
     def _dnd_done(self, target, command_ok, actual):
+        if self._destroyed:
+            return False
         if command_ok and actual is not None and actual == target:
             self._dnd_apply(actual)
             self._toast(T("dnd_on") if actual else T("dnd_off"), timeout_ms=1600)
@@ -3558,7 +4466,7 @@ class ControlCenter(Gtk.Window):
         specs.append(dict(key="wake", svg="coffee", title=T("tile_wake"), sub=T("off"),
                           tip=T("tip_wake"),
                           click=self._wake_click, read=wake_on, apply=self._wake_apply))
-        if which("pactl"):
+        if which("pactl") or which("wpctl"):
             specs.append(dict(key="mic", svg="mic", title=T("tile_mic"), sub="…",
                               tip=T("tip_mic"),
                               click=self._mic_click, read=mic_muted, apply=self._mic_apply))
@@ -3594,13 +4502,11 @@ class ControlCenter(Gtk.Window):
                               sub=ROT_LABEL.get(rot, "0°"),
                               tip=T("tip_rotate"),
                               click=self._rot_click, read=screen_rotation, apply=self._rot_apply))
-        if info.get("out"):
-            rows, cur = info["out"]
-            self._sinks, self._sink_cur = list(rows), cur
+        if which("pactl") or which("wpctl"):
             specs.append(dict(key="out", svg="speaker", title=T("tile_output"),
-                              sub=next((dsc for n, dsc in rows if n == cur), "…"),
+                              sub=T("loading"),
                               tip=T("tip_out"),
-                              click=self._out_click, read=sinks, apply=self._out_apply))
+                              click=self._out_click))
         if info.get("osk"):
             specs.append(dict(key="osk", svg="keyboard", title=T("tile_keyboard"), sub="Onboard",
                               tip=T("tip_osk"),
@@ -3693,11 +4599,12 @@ class ControlCenter(Gtk.Window):
         return False
 
     def _build_action_browser(self, root):
-        row = Gtk.Box(spacing=4)
+        row = Gtk.Box(spacing=3)
+        row.get_style_context().add_class("category-bar")
         self._category_buttons = {}
         for key in ("all", "connections", "tools", "device"):
             button = Gtk.Button(label=T(key))
-            button.get_style_context().add_class("listitem")
+            button.get_style_context().add_class("category-button")
             button.connect("clicked", lambda _, k=key: self._select_category(k))
             row.pack_start(button, True, True, 0)
             self._category_buttons[key] = button
@@ -3770,6 +4677,8 @@ class ControlCenter(Gtk.Window):
         GLib.idle_add(self._tiles_refresh_apply, extra)
 
     def _tiles_refresh_apply(self, extra):
+        if self._destroyed:
+            return False
         try:
             self._updating = True
             for sp in self._specs:
@@ -3797,7 +4706,7 @@ class ControlCenter(Gtk.Window):
         btn_ctx.add_class("knob")
         if initial_on:
             btn_ctx.add_class("on")
-        btn.set_image(svg_image(sp["svg"], color=(ACCENT if initial_on else "#ffffff")))
+        btn.set_image(svg_image(sp["svg"], color=(ACCENT if initial_on else _inactive_icon_color())))
         btn.set_always_show_image(True)
         btn.set_halign(Gtk.Align.CENTER)
         btn.set_tooltip_text(sp.get("tip", sp["title"]))
@@ -3861,7 +4770,7 @@ class ControlCenter(Gtk.Window):
             self._tsvg[key] = svg
         icon_name = self._tsvg.get(key)
         if icon_name:
-            img = svg_image(icon_name, color=(ACCENT if ctx.has_class("on") else "#ffffff"))
+            img = svg_image(icon_name, color=(ACCENT if ctx.has_class("on") else _inactive_icon_color()))
             btn.set_image(img)
             img.show()
 
@@ -3875,20 +4784,52 @@ class ControlCenter(Gtk.Window):
         self._tile_set("wake", on=on, sub=T("active") if on else T("off"))
 
     def _wake_click(self):
+        if self._busy.get("wake"):
+            return
         on = not self._st.get("wake", False)
-        wake_set(on)
-        self._wake_apply(on)
-        self._busy_for("wake", 1500)
+        self._busy["wake"] = True
+        threading.Thread(target=self._wake_worker, args=(on,), daemon=True).start()
+
+    def _wake_worker(self, target):
+        actual = None
+        try:
+            wake_set(target)
+            actual = wake_on()
+        except (OSError, subprocess.TimeoutExpired):
+            logging.warning("Awake command failed or timed out")
+        GLib.idle_add(self._wake_done, actual)
+
+    def _wake_done(self, actual):
+        if self._destroyed:
+            return False
+        self._busy["wake"] = False
+        if actual is None:
+            self._toast(T("settings_failed"), error=True)
+        else:
+            self._wake_apply(actual)
+        return False
 
     # Mikrofon
     def _mic_apply(self, muted):
         self._st["mic"] = muted
         self._tile_set("mic", warn=muted, svg="micoff" if muted else "mic",
                        sub=T("muted") if muted else T("active"))
+        if hasattr(self, "_sound_mic_switch"):
+            self._sound_mic_switch.set_active(not muted)
+            self._sound_input.set_text(T("muted") if muted else T("active"))
+
+    def _sound_input_changed(self, switch, active):
+        if bool(self._st.get("mic", False)) == (not bool(active)):
+            return False
+        self._mic_click()
+        return False
 
     def _mic_click(self):
         muted = not self._st.get("mic", False)
-        subprocess.Popen(["pactl", "set-source-mute", "@DEFAULT_SOURCE@", "1" if muted else "0"])
+        value = "1" if muted else "0"
+        subprocess.Popen(self._audio_control_command(
+            ["set-source-mute", "@DEFAULT_SOURCE@", value],
+            ["set-mute", "@DEFAULT_AUDIO_SOURCE@", value]))
         self._mic_apply(muted)
         self._busy_for("mic", 1500)
 
@@ -3915,6 +4856,8 @@ class ControlCenter(Gtk.Window):
         GLib.idle_add(self._plane_done, airplane_on())
 
     def _plane_done(self, on):
+        if self._destroyed:
+            return False
         self._busy["plane"] = False
         self._last.pop("t:plane", None)
         self._plane_apply(on)
@@ -3940,6 +4883,8 @@ class ControlCenter(Gtk.Window):
         GLib.idle_add(self._pp_done, pp_state())
 
     def _pp_done(self, v):
+        if self._destroyed:
+            return False
         self._busy["pp"] = False
         self._last.pop("t:pp", None)
         self._pp_apply(v)
@@ -3966,6 +4911,8 @@ class ControlCenter(Gtk.Window):
         GLib.idle_add(self._inp_done, key, input_enabled(name))
 
     def _inp_done(self, key, on):
+        if self._destroyed:
+            return False
         self._busy[key] = False
         self._last.pop("t:" + key, None)
         self._inp_apply(key, on)
@@ -3996,6 +4943,8 @@ class ControlCenter(Gtk.Window):
         GLib.idle_add(self._rot_done, screen_rotation())
 
     def _rot_done(self, v):
+        if self._destroyed:
+            return False
         self._busy["rot"] = False
         self._last.pop("t:rot", None)
         self._rot_apply(v)
@@ -4007,39 +4956,97 @@ class ControlCenter(Gtk.Window):
 
     # Audio-Ausgabe
     def _out_apply(self, v):
-        rows, cur = v
-        self._sinks, self._sink_cur = list(rows), cur
-        desc = next((d for n, d in rows if n == cur), cur)
+        if not isinstance(v, dict):
+            v = {"status": "error", "devices": [], "default": "", "backend": ""}
+        status = v.get("status", "error")
+        devices = list(v.get("devices", []))
+        current = v.get("default", "")
+        self._sinks, self._sink_cur = devices, current
+        self._audio_control_backend = v.get("backend", "")
+        self._audio_backend = v.get("server") or self._audio_control_backend
+        controls_ready = status == "ready" and self._audio_control_backend in ("pactl", "wpctl")
+        for control in (getattr(self, "vol_mod", None), getattr(self, "_sound_scale", None),
+                        getattr(self, "_sound_mute_button", None),
+                        getattr(self, "_sound_mic_switch", None)):
+            if control is not None:
+                control.set_sensitive(controls_ready)
+        desc = next((d.get("description", d.get("name", ""))
+                     for d in devices if d.get("id") == current), "")
+        self._audio_status = status
+        if status != "ready":
+            message = {"loading": "loading", "empty": "audio_empty", "unavailable": "unavailable",
+                       "backend_unavailable": "audio_backend_unavailable",
+                       "timeout": "audio_timeout", "error": "audio_error"}.get(status, "audio_error")
+            desc = T(message)
         self._tile_set("out", sub=desc)
+        if hasattr(self, "_sound_output"):
+            self._sound_output.set_text(desc or T("unavailable"))
+            self._sound_output_button.set_sensitive(status == "ready" and len(devices) > 1)
+            self._sound_output_button.set_tooltip_text(
+                T("tip_out") if len(devices) > 1 else
+                T("single_output") if status == "ready" else desc)
         t = self._tiles.get("out")
         if t:
-            t[0].set_tooltip_text(T("tip_out_now", d=desc))
+            t[0].set_tooltip_text(T("tip_out_now", d=desc) if status == "ready" else desc)
+
+    def _refresh_audio_outputs(self):
+        if self._audio_refreshing or self._busy.get("out"):
+            return
+        self._audio_refreshing = True
+        self._audio_generation += 1
+        generation = self._audio_generation
+        if self._audio_status != "ready":
+            self._out_apply({"status": "loading", "devices": [], "default": ""})
+        threading.Thread(target=self._audio_refresh_worker, args=(generation,), daemon=True).start()
+
+    def _audio_refresh_worker(self, generation):
+        try:
+            result = sinks()
+        except subprocess.TimeoutExpired:
+            result = {"status": "timeout", "devices": [], "default": "", "backend": ""}
+        except Exception:
+            logging.exception("Audio discovery worker failed")
+            result = {"status": "error", "devices": [], "default": "", "backend": ""}
+        GLib.idle_add(self._audio_refresh_apply, generation, result)
+
+    def _audio_refresh_apply(self, generation, result):
+        if generation == self._audio_generation:
+            self._audio_refreshing = False
+        if generation == self._audio_generation and not self._destroyed:
+            self._out_apply(result)
+        return False
 
     def _out_click(self):
-        names = [n for n, _ in self._sinks]
-        if len(names) < 2:
+        if self._audio_status != "ready" or len(self._sinks) < 2 or self._busy.get("out"):
             return
-        nxt = names[(names.index(self._sink_cur) + 1) % len(names)] if self._sink_cur in names else names[0]
+        ids = [device["id"] for device in self._sinks]
+        nxt_id = ids[(ids.index(self._sink_cur) + 1) % len(ids)] if self._sink_cur in ids else ids[0]
+        device = next(item for item in self._sinks if item["id"] == nxt_id)
         self._busy["out"] = True
-        self._sink_cur = nxt
-        self._tile_set("out", sub=next((d for n, d in self._sinks if n == nxt), nxt))
-        threading.Thread(target=self._out_worker, args=(nxt,), daemon=True).start()
+        self._audio_generation += 1
+        generation = self._audio_generation
+        if hasattr(self, "_sound_output_button"):
+            self._sound_output_button.set_sensitive(False)
+        threading.Thread(target=self._out_worker, args=(generation, device), daemon=True).start()
 
-    def _out_worker(self, nxt):
+    def _out_worker(self, generation, device):
         try:
-            subprocess.run(["pactl", "set-default-sink", nxt], capture_output=True, timeout=4)
-            for line in shc("pactl", "list", "short", "sink-inputs").splitlines():
-                if line.split():
-                    subprocess.run(["pactl", "move-sink-input", line.split()[0], nxt],
-                                   capture_output=True, timeout=4)
+            success = set_audio_output(device)
+            result = sinks()
         except Exception:
-            pass
-        GLib.idle_add(self._out_done, sinks())
+            success = False
+            result = {"status": "error", "devices": [], "default": "", "backend": ""}
+        GLib.idle_add(self._out_done, generation, success, result)
 
-    def _out_done(self, v):
+    def _out_done(self, generation, success, result):
+        if generation != self._audio_generation or self._destroyed:
+            return False
+        self._audio_refreshing = False
         self._busy["out"] = False
         self._last.pop("t:out", None)
-        self._out_apply(v)
+        self._out_apply(result)
+        if not success:
+            self._toast(T("audio_error"), error=True)
         return False
 
     # ══════════════════ Aktionsleiste mit aufklappbaren Menüs ══════════════════
@@ -4324,7 +5331,13 @@ class ControlCenter(Gtk.Window):
         self._clear_confirm()
         self._act_mode = mode
         self._act_rev.set_transition_duration(self._animation_duration(160))
-        self._act_fill()
+        try:
+            self._act_fill()
+        except Exception:
+            logging.exception("Settings/action page construction failed: %s", mode)
+            self._act_close()
+            self._toast(T("page_error"), error=True)
+            return
         self._act_rev.set_reveal_child(True)
         self._schedule_dynamic_resize(185)
         for k, b in self._act_btns.items():
@@ -4364,64 +5377,185 @@ class ControlCenter(Gtk.Window):
         self._act_list.show_all()
         self._schedule_dynamic_resize(50)
 
+    def _settings_group(self, title):
+        heading = Gtk.Label(label=title, xalign=0)
+        heading.get_style_context().add_class("settings-section")
+        heading.set_margin_start(5)
+        heading.set_margin_top(7)
+        heading.set_margin_bottom(2)
+        self._act_list.pack_start(heading, False, False, 0)
+        group = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        group.get_style_context().add_class("settings-group")
+        self._act_list.pack_start(group, False, False, 1)
+        return group
+
+    def _settings_separator(self, group):
+        if group.get_children():
+            separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+            separator.get_style_context().add_class("control-divider")
+            group.pack_start(separator, False, False, 0)
+
+    def _settings_choice(self, group, title, value, callback, preview=None,
+                         selected=False, chevron=True):
+        self._settings_separator(group)
+        button = Gtk.Button()
+        button.set_relief(Gtk.ReliefStyle.NONE)
+        button.get_style_context().add_class("settings-row")
+        row = Gtk.Box(spacing=8)
+        label = Gtk.Label(label=title, xalign=0)
+        label.set_ellipsize(3)
+        label.set_max_width_chars(30)
+        row.pack_start(label, True, True, 0)
+        if preview:
+            samples = Gtk.Box(spacing=3)
+            preview_kind, preview_value = preview.split(":", 1)
+            palette = (THEME_TOKENS.get(preview_value, THEME_TOKENS["midnight"])
+                       if preview_kind == "theme" else
+                       {"window_background": UI_TOKENS["background"],
+                        "card_surface": UI_TOKENS["surface"],
+                        "accent_treatment": ACCENT_PALETTE.get(
+                            preview_value, ACCENT_PALETTE["blue"])[0]})
+            for color in (palette["window_background"], palette["card_surface"],
+                          palette.get("accent_treatment", ACCENT_PALETTE["blue"][0])):
+                swatch = Gtk.EventBox()
+                swatch.set_visible_window(True)
+                swatch.set_size_request(11, 11)
+                rgba = Gdk.RGBA()
+                rgba.parse(color)
+                swatch.override_background_color(Gtk.StateFlags.NORMAL, rgba)
+                samples.pack_start(swatch, False, False, 0)
+            row.pack_start(samples, False, False, 0)
+        elif value:
+            value_label = Gtk.Label(label=value, xalign=1)
+            value_label.get_style_context().add_class("settings-value")
+            value_label.set_ellipsize(3)
+            value_label.set_max_width_chars(18)
+            row.pack_start(value_label, False, False, 0)
+        if chevron:
+            row.pack_end(Gtk.Image.new_from_icon_name("go-next-symbolic", Gtk.IconSize.MENU), False, False, 0)
+        if selected:
+            check = Gtk.Image.new_from_icon_name("object-select-symbolic", Gtk.IconSize.MENU)
+            check.get_style_context().add_class("settings-selected")
+            row.pack_end(check, False, False, 0)
+        button.add(row)
+        button.set_tooltip_text(title + (": " + value if value else ""))
+        try:
+            button.get_accessible().set_name(title + (": " + value if value else ""))
+        except Exception:
+            pass
+        button.connect("clicked", lambda *_: callback())
+        group.pack_start(button, False, False, 0)
+        return button
+
+    def _settings_toggle(self, group, title, enabled, callback):
+        self._settings_separator(group)
+        row = Gtk.Box(spacing=8)
+        row.get_style_context().add_class("settings-toggle-row")
+        label = Gtk.Label(label=title, xalign=0)
+        label.set_ellipsize(3)
+        label.set_max_width_chars(34)
+        row.pack_start(label, True, True, 0)
+        switch = Gtk.Switch()
+        switch.set_active(bool(enabled))
+        switch.set_valign(Gtk.Align.CENTER)
+        switch.get_style_context().add_class("settings-switch")
+        def changed(widget, *_args):
+            if callback() is False:
+                widget.handler_block(handler)
+                widget.set_active(not widget.get_active())
+                widget.handler_unblock(handler)
+        handler = switch.connect("notify::active", changed)
+        switch.set_tooltip_text(title)
+        row.pack_end(switch, False, False, 0)
+        group.pack_start(row, False, False, 0)
+        return switch
+
     def _fill_settings(self):
-        self._head(T("appearance"))
+        self._item(T("back"), self._act_close)
+        appearance = self._settings_group(T("appearance"))
         theme = CFG.get("theme", "midnight")
         accent = CFG.get("accent_color", "blue")
-        theme_label = T("theme_" + theme)
-        accent_label = T("accent_" + accent)
-        self._item(T("theme_setting", v=theme_label), lambda: self._act_toggle("settings_theme"))
-        self._item(T("accent_setting", v=accent_label), lambda: self._act_toggle("settings_accent"))
         language = CFG.get("language", "auto")
-        self._item(T("language_setting", v=T("language_" + language)), lambda: self._act_toggle("settings_language"))
-        speed = CFG.get("animation_speed", "smooth")
-        self._item(T("animation_setting", v=T("animation_" + speed)), lambda: self._act_toggle("settings_animation"))
-        motion_key = "motion_off" if CFG.get("reduce_motion", False) else "motion_on"
-        self._item(T(motion_key), self._toggle_reduce_motion)
+        self._settings_choice(appearance, T("setting_theme"), T("theme_" + theme),
+                              lambda: self._act_toggle("settings_theme"), preview="theme:" + theme)
+        self._settings_choice(appearance, T("setting_accent"), T("accent_" + accent),
+                              lambda: self._act_toggle("settings_accent"), preview="accent:" + accent)
+        self._settings_choice(appearance, T("setting_language"), T("language_" + language),
+                              lambda: self._act_toggle("settings_language"))
 
-        self._head(T("resources"))
-        self._item(T("profile_" + CFG.get("resource_profile", "balanced")), lambda: self._open_workspace("resources"))
-        self._item(T("devices"), lambda: self._open_workspace("devices"))
-        self._item(T("overview"), lambda: self._open_workspace("overview"))
-        self._head(T("behavior"))
-        self._item(T("refresh_now"), self._manual_refresh)
-        self._item(T("poll_interval", s=self.POLL_SECONDS), self._cycle_poll_interval)
-        stay_key = "stay_open_on" if CFG.get("stay_open", False) else "stay_open_off"
-        stay_item = self._item(T(stay_key), self._toggle_stay_open)
-        stay_item.set_tooltip_text(T("stay_open_help"))
+        controls = self._settings_group(T("setting_quick_actions"))
+        self._settings_choice(controls, T("setting_quick_actions"), "",
+                              lambda: self._act_toggle("tiles"))
+        self._settings_choice(controls, T("devices"), str(len(CFG.get("devices", []))),
+                              lambda: self._open_workspace("devices"))
+        self._settings_toggle(controls, T("setting_compact"), CFG.get("compact_actions", True),
+                              self._toggle_compact_setting)
+        self._settings_toggle(controls, T("setting_media_card"), CFG.get("media_card", True),
+                              self._toggle_media_card)
+        self._settings_toggle(controls, T("setting_media_art"), CFG.get("media_thumbnail", True),
+                              self._toggle_media_thumbnail)
+        self._settings_toggle(controls, T("setting_media_progress"), CFG.get("media_progress", True),
+                              lambda: self._toggle_preference("media_progress"))
+        self._settings_toggle(controls, T("setting_media_idle"), CFG.get("media_hide_idle", False),
+                              lambda: self._toggle_preference("media_hide_idle"))
 
-        self._head(T("media_settings"))
-        media_key = "media_thumbnail_on" if CFG.get("media_thumbnail", True) else "media_thumbnail_off"
-        self._item(T(media_key), self._toggle_media_thumbnail)
-        self._head(T("diagnostics"))
-        self._item(T("diagnostics"), lambda: self._act_toggle("diagnostics"))
+        behavior = self._settings_group(T("behavior"))
+        self._settings_toggle(behavior, T("setting_feedback"), CFG.get("feedback", True),
+                              lambda: self._toggle_preference("feedback"))
+        self._settings_toggle(behavior, T("setting_animations"), CFG.get("reduce_motion", False),
+                              self._toggle_reduce_motion)
+        self._settings_toggle(behavior, T("setting_focus_close"), not CFG.get("stay_open", False),
+                              self._toggle_stay_open)
+        self._settings_choice(behavior, T("setting_animation_speed"),
+                              T("animation_" + CFG.get("animation_speed", "smooth")),
+                              lambda: self._act_toggle("settings_animation"))
+
+        monitoring = self._settings_group(T("resources"))
+        self._settings_choice(monitoring, T("setting_resource"),
+                              T("profile_" + CFG.get("resource_profile", "balanced")),
+                              lambda: self._open_workspace("resources"))
+        self._settings_choice(monitoring, T("setting_refresh"),
+                              T("poll_interval", s=self.POLL_SECONDS), self._cycle_poll_interval)
+        about = self._settings_group(T("diagnostics"))
+        self._settings_choice(about, T("setting_diagnostics"), APP_VERSION,
+                              lambda: self._act_toggle("diagnostics"))
 
     def _fill_theme_options(self):
-        self._head(T("theme_setting", v=T("theme_" + CFG.get("theme", "midnight"))))
-        for value in ("midnight", "graphite", "light"):
-            marker = "✓  " if CFG.get("theme") == value else ""
-            self._item(marker + T("theme_" + value), lambda v=value: self._select_setting("theme", v, visual=True))
+        self._head(T("setting_theme"))
+        group = self._settings_group(T("appearance"))
+        for value in ("midnight", "graphite", "frosted", "light"):
+            self._settings_choice(group, T("theme_" + value), "",
+                                  lambda v=value: self._select_setting("theme", v, visual=True),
+                                  preview="theme:" + value, selected=CFG.get("theme") == value,
+                                  chevron=False)
         self._item(T("settings_title"), lambda: self._act_toggle("settings"))
 
     def _fill_accent_options(self):
-        self._head(T("accent_setting", v=T("accent_" + CFG.get("accent_color", "blue"))))
-        for value in ("blue", "purple", "teal", "pink"):
-            marker = "✓  " if CFG.get("accent_color") == value else ""
-            self._item(marker + T("accent_" + value), lambda v=value: self._select_setting("accent_color", v, visual=True))
+        self._head(T("setting_accent"))
+        group = self._settings_group(T("appearance"))
+        for value in _CFG_ACCENTS:
+            self._settings_choice(group, T("accent_" + value), "",
+                                  lambda v=value: self._select_setting("accent_color", v, visual=True),
+                                  preview="accent:" + value, selected=CFG.get("accent_color") == value,
+                                  chevron=False)
         self._item(T("settings_title"), lambda: self._act_toggle("settings"))
 
     def _fill_language_options(self):
-        self._head(T("language_setting", v=T("language_" + CFG.get("language", "auto"))))
+        self._head(T("setting_language"))
+        group = self._settings_group(T("appearance"))
         for value in ("auto", "de", "en", "it", "fr", "es"):
-            marker = "✓  " if CFG.get("language") == value else ""
-            self._item(marker + T("language_" + value), lambda v=value: self._select_language(v))
+            self._settings_choice(group, T("language_" + value), "",
+                                  lambda v=value: self._select_language(v),
+                                  selected=CFG.get("language") == value, chevron=False)
         self._item(T("settings_title"), lambda: self._act_toggle("settings"))
 
     def _fill_animation_options(self):
-        self._head(T("animation_setting", v=T("animation_" + CFG.get("animation_speed", "smooth"))))
+        self._head(T("setting_animation_speed"))
+        group = self._settings_group(T("behavior"))
         for value in ("smooth", "fast", "off"):
-            marker = "✓  " if CFG.get("animation_speed") == value else ""
-            self._item(marker + T("animation_" + value), lambda v=value: self._select_setting("animation_speed", v, visual=False))
+            self._settings_choice(group, T("animation_" + value), "",
+                                  lambda v=value: self._select_setting("animation_speed", v, visual=False),
+                                  selected=CFG.get("animation_speed") == value, chevron=False)
         self._item(T("settings_title"), lambda: self._act_toggle("settings"))
 
     def _select_setting(self, key, value, visual=False):
@@ -4431,7 +5565,7 @@ class ControlCenter(Gtk.Window):
             self._apply_visual_preferences()
         if key == "animation_speed":
             duration = self._animation_duration(160)
-            self._detail_rev.set_transition_duration(duration)
+            self._content_stack.set_transition_duration(duration)
             self._act_rev.set_transition_duration(duration)
             self._schedule_dynamic_resize(40)
         self._act_toggle("settings")
@@ -4446,16 +5580,31 @@ class ControlCenter(Gtk.Window):
             GLib.timeout_add(750, self._restart_for_language)
 
     def _save_setting(self, key, value):
+        cleaned = _cfg_value(key, value)
+        if cleaned is None:
+            self._toast(T("settings_failed"), error=True)
+            return False
         updated = dict(CFG)
-        updated[key] = value
+        updated[key] = cleaned
         if not _persist_config(updated):
             self._toast(T("settings_failed"), error=True)
             return False
         CFG.update(updated)
         return True
 
+    def _toggle_preference(self, key):
+        if key not in ("media_progress", "media_hide_idle", "feedback"):
+            return False
+        if not self._save_setting(key, not CFG[key]):
+            return False
+        if key.startswith("media_"):
+            self._set_media(self._last.get("media"))
+            self._schedule_dynamic_resize(50)
+        self._act_fill()
+        return True
+
     def _cycle_theme(self):
-        choices = ("midnight", "graphite", "light")
+        choices = _CFG_THEMES
         current = CFG.get("theme", "midnight")
         value = choices[(choices.index(current) + 1) % len(choices)]
         if self._save_setting("theme", value):
@@ -4464,7 +5613,7 @@ class ControlCenter(Gtk.Window):
             self._toast(T("settings_saved"))
 
     def _cycle_accent(self):
-        choices = ("blue", "purple", "teal", "pink")
+        choices = _CFG_ACCENTS
         current = CFG.get("accent_color", "blue")
         value = choices[(choices.index(current) + 1) % len(choices)]
         if self._save_setting("accent_color", value):
@@ -4474,7 +5623,8 @@ class ControlCenter(Gtk.Window):
 
     def _apply_visual_preferences(self):
         global ACCENT
-        ACCENT = ACCENT_PALETTE.get(CFG.get("accent_color", "blue"), ACCENT_PALETTE["blue"])[0]
+        ACCENT = _accent_for_theme(CFG.get("theme", "midnight"),
+                                   CFG.get("accent_color", "blue"))[0]
         try:
             self._css_provider.load_from_data(
                 _theme_css(CFG.get("theme", "midnight"), CFG.get("accent_color", "blue")).encode()
@@ -4488,7 +5638,7 @@ class ControlCenter(Gtk.Window):
             icon_name = self._toggle_icons.get(id(button))
             if icon_name:
                 active = button.get_style_context().has_class("on")
-                button.set_image(svg_image(icon_name, color=(ACCENT if active else "#ffffff")))
+                button.set_image(svg_image(icon_name, color=(ACCENT if active else _inactive_icon_color())))
         if self._tile_info is not None:
             self._tiles_build(self._tile_info)
 
@@ -4498,7 +5648,7 @@ class ControlCenter(Gtk.Window):
         value = choices[(choices.index(current) + 1) % len(choices)]
         if self._save_setting("animation_speed", value):
             duration = self._animation_duration(160)
-            self._detail_rev.set_transition_duration(duration)
+            self._content_stack.set_transition_duration(duration)
             self._act_rev.set_transition_duration(duration)
             self._toast(T("settings_saved"))
             self._act_fill()
@@ -4522,16 +5672,44 @@ class ControlCenter(Gtk.Window):
 
     def _toggle_media_thumbnail(self):
         value = not bool(CFG.get("media_thumbnail", True))
-        if self._save_setting("media_thumbnail", value):
-            if not value:
-                self._m_art_generation += 1
-                self._m_art_url = None
-                self._reset_media_cover()
-            else:
-                self._last.pop("media", None)
+        if not self._save_setting("media_thumbnail", value):
+            return False
+        if not value:
+            self._m_art_generation += 1
+            self._m_art_url = None
+            self._reset_media_cover()
+        else:
+            self._last.pop("media", None)
+            self._media_async()
+        self._act_fill()
+        self._toast(T("settings_saved"))
+        return True
+
+    def _toggle_media_card(self):
+        value = not bool(CFG.get("media_card", True))
+        if not self._save_setting("media_card", value):
+            return False
+        if self._media_box is not None:
+            self._media_box.set_no_show_all(not value)
+            if value:
+                self._media_box.show()
                 self._media_async()
-            self._act_fill()
-            self._toast(T("settings_saved"))
+            else:
+                self._media_box.hide()
+                self._schedule_dynamic_resize(185)
+        self._act_fill()
+        self._toast(T("settings_saved"))
+        return True
+
+    def _toggle_compact_setting(self):
+        value = not bool(CFG.get("compact_actions", True))
+        if not self._save_setting("compact_actions", value):
+            return False
+        self._expanded_actions = not value
+        self._render_actions()
+        self._act_fill()
+        self._toast(T("settings_saved"))
+        return True
 
     def _manual_refresh(self):
         self._act_close()
@@ -4558,24 +5736,26 @@ class ControlCenter(Gtk.Window):
         updated["reduce_motion"] = not bool(CFG.get("reduce_motion", False))
         if not _persist_config(updated):
             self._toast(T("settings_failed"), error=True)
-            return
+            return False
         CFG.update(updated)
         duration = self._animation_duration(160)
-        self._detail_rev.set_transition_duration(duration)
+        self._content_stack.set_transition_duration(duration)
         self._act_rev.set_transition_duration(duration)
         self._toast(T("settings_saved"))
         self._act_fill()
         self._schedule_dynamic_resize(50)
+        return True
 
     def _toggle_stay_open(self):
         updated = dict(CFG)
         updated["stay_open"] = not bool(CFG.get("stay_open", False))
         if not _persist_config(updated):
             self._toast(T("settings_failed"), error=True)
-            return
+            return False
         CFG.update(updated)
         self._act_fill()
         self._toast(T("settings_saved"))
+        return True
 
     def _open_system_settings(self):
         if which("xfce4-settings-manager"):
@@ -4599,7 +5779,7 @@ class ControlCenter(Gtk.Window):
             if mon is not None:
                 geo = mon.get_geometry()
                 display_value = f"{geo.width}x{geo.height}"
-        tools = ("nmcli", "rfkill", "bluetoothctl", "pactl", "playerctl",
+        tools = ("nmcli", "rfkill", "bluetoothctl", "pactl", "wpctl", "playerctl",
                  "xrandr", "gammastep", "flatpak", "xfce4-settings-manager")
         present = [name for name in tools if which(name)]
         lines = [
@@ -4612,6 +5792,9 @@ class ControlCenter(Gtk.Window):
             "Display: " + display_value,
             "Session: " + os.environ.get("XDG_SESSION_TYPE", "unknown"),
             "Available helper tools: " + (", ".join(present) if present else "none detected"),
+            "Audio backend: " + (self._audio_backend or self._audio_status),
+            "Bluetooth state check: " + self._bt_last_status,
+            "Config file: " + CONFIG_FILE,
             "Popup resize cap: " + str(self._available_popup_height()) + " px",
             "Reduced motion: " + str(bool(CFG.get("reduce_motion", False))),
             "Refresh interval: " + str(self.POLL_SECONDS) + " s",
@@ -4638,7 +5821,8 @@ class ControlCenter(Gtk.Window):
             if mon is not None:
                 geo = mon.get_geometry()
                 display_value = f"{geo.width} × {geo.height}"
-        available = [name for name in ("nmcli", "rfkill", "pactl", "playerctl", "xrandr", "gammastep") if which(name)]
+        available = [name for name in ("nmcli", "rfkill", "bluetoothctl", "pactl", "wpctl",
+                                      "playerctl", "xrandr", "gammastep") if which(name)]
         lines = [
             T("diag_version", v=APP_VERSION),
             T("diag_cpu", v=os.cpu_count() or "?"),
@@ -4646,6 +5830,7 @@ class ControlCenter(Gtk.Window):
             T("diag_display", v=display_value),
             T("diag_session", v=os.environ.get("XDG_SESSION_TYPE", "unknown")),
             T("diag_tools", v=(", ".join(available) if available else "—")),
+            "Config: " + CONFIG_FILE,
         ]
         for text in lines:
             label = Gtk.Label(label=text, xalign=0)
@@ -4747,17 +5932,19 @@ class ControlCenter(Gtk.Window):
                            self._toggle_quick_action(action_key, button.get_active()))
             row.pack_start(check, True, True, 0)
 
-            up = Gtk.Button(label="↑")
+            up = Gtk.Button.new_from_icon_name("go-up-symbolic", Gtk.IconSize.MENU)
             up.set_relief(Gtk.ReliefStyle.NONE)
             up.set_tooltip_text(T("tiles_up"))
+            up.get_accessible().set_name(T("tiles_up"))
             up.set_sensitive(active and positions.get(key, 0) > 0)
             up.connect("clicked", lambda _b, action_key=key:
                        self._move_quick_action(action_key, -1))
             row.pack_start(up, False, False, 0)
 
-            down = Gtk.Button(label="↓")
+            down = Gtk.Button.new_from_icon_name("go-down-symbolic", Gtk.IconSize.MENU)
             down.set_relief(Gtk.ReliefStyle.NONE)
             down.set_tooltip_text(T("tiles_down"))
+            down.get_accessible().set_name(T("tiles_down"))
             down.set_sensitive(active and positions.get(key, -1) < len(order) - 1)
             down.connect("clicked", lambda _b, action_key=key:
                          self._move_quick_action(action_key, 1))
@@ -5590,6 +6777,7 @@ class ControlCenter(Gtk.Window):
             return False
         if self._resident and not self.get_visible() and self._resident_primed:
             return True
+        self._refresh_audio_outputs()
         if self._polling:
             self._rerun = True
         else:
@@ -5600,16 +6788,18 @@ class ControlCenter(Gtk.Window):
 
     def _poll_collect(self, n):
         # Leseabfragen parallel; dieser Worker verändert keine GTK-Widgets.
+        bt_generation = self._bt_generation
+        audio_backend = self._audio_control_backend
         def read_wifi():
             on = wifi_on()
             return on, wifi_ssid() if on else ""
 
         jobs = {
             "wifi_pair": read_wifi,
-            "bt": bt_on,
+            "bt": bluetooth_state,
             "vpn": vpn_state,
-            "vol": volume_pct,
-            "mute": sink_muted,
+            "vol": lambda: volume_pct(audio_backend),
+            "mute": lambda: sink_muted(audio_backend),
             "bl": lambda: brightness_pct()[0],
             "kbd": lambda: kbd_pct()[0],
             "bat": battery,
@@ -5619,9 +6809,11 @@ class ControlCenter(Gtk.Window):
         }
 
         requirements = {"wifi_pair": "nmcli", "bt": "bluetoothctl", "vpn": "nmcli",
-                        "vol": "pactl", "mute": "pactl", "media": "playerctl"}
+                        "vol": "audio", "mute": "audio", "media": "playerctl"}
         jobs = {key: fn for key, fn in jobs.items()
-                if key not in requirements or which(requirements[key])}
+                if key not in requirements or
+                ((which("pactl") or which("wpctl")) if requirements[key] == "audio"
+                 else which(requirements[key]))}
         # Alle unabhängigen Abfragen an denselben begrenzten Threadpool geben.
         futures = {
             key: self._poll_executor.submit(func)
@@ -5653,6 +6845,7 @@ class ControlCenter(Gtk.Window):
                 else:
                     data = {key: value}
                 data["_partial"] = True
+                data["_bt_generation"] = bt_generation
                 GLib.idle_add(self._apply, data)
             except Exception:
                 errors.append(key)
@@ -5678,10 +6871,17 @@ class ControlCenter(Gtk.Window):
                 self._st["wifi"] = d["wifi"]
                 self._flip(self.btn_wifi, d["wifi"])
                 self.btn_wifi[2].set_text(d["ssid"] or (T("on") if d["wifi"] else T("off")))
-            if "bt" in d and chg("bt", d["bt"]):
-                self._st["bt"] = d["bt"]
-                self._flip(self.btn_bt, d["bt"])
-                self.btn_bt[2].set_text(T("on") if d["bt"] else T("off"))
+            if ("bt" in d and not self._bt_pending
+                    and d.get("_bt_generation") == self._bt_generation
+                    and chg("bt", d["bt"])):
+                state = d["bt"]
+                self._bt_last_status = state["status"]
+                if state.get("powered") is not None:
+                    self._st["bt"] = state["powered"]
+                    self._flip(self.btn_bt, state["powered"])
+                    self.btn_bt[2].set_text(T("on") if state["powered"] else T("off"))
+                else:
+                    self.btn_bt[2].set_text(T("unavailable"))
             if "vpn" in d and chg("vpn", d["vpn"]):
                 self._vpn_apply(d["vpn"])
             if self.btn_ns and d.get("ns") is not None and chg("ns", d["ns"]):
@@ -5692,6 +6892,8 @@ class ControlCenter(Gtk.Window):
             if GLib.get_monotonic_time() >= self._hold:
                 if "vol" in d and chg("vol_value", d["vol"]):
                     self.vol_mod.scale.set_value(d["vol"])
+                    if hasattr(self, "_sound_scale"):
+                        self._sound_scale.set_value(d["vol"])
                 if "mute" in d and chg("mute_value", d["mute"]):
                     self._muted = d["mute"]
                     self._refresh_volume_icon()
@@ -5814,7 +7016,96 @@ def _is_resident_control_center(pid):
         return False
 
 
+def diagnose(mode="--diagnose"):
+    """Read-only probes; no GTK window, config write, service activation or power action."""
+    report = {"version": APP_VERSION, "script": os.path.realpath(__file__),
+              "session": os.environ.get("XDG_SESSION_TYPE", "unknown")}
+
+    def probe(argv):
+        if not which(argv[0]):
+            return {"status": "unavailable", "exit": None, "output": ""}
+        try:
+            value = _command_result(argv, timeout=4)
+            output = re.sub(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", "[redacted]",
+                            value.stdout + value.stderr)
+            return {"status": "success" if value.returncode == 0 else "command_failed",
+                    "exit": value.returncode, "output": output.strip()[:2000]}
+        except subprocess.TimeoutExpired:
+            return {"status": "timeout", "exit": None, "output": ""}
+        except OSError:
+            return {"status": "unavailable", "exit": None, "output": ""}
+
+    if mode in ("--diagnose", "--diagnose-bluetooth"):
+        listed = probe(["bluetoothctl", "list"])
+        shown = probe(["bluetoothctl", "show"])
+        # Names/aliases can contain personal information. Keep only controller count
+        # and the capabilities needed to diagnose a power operation.
+        count = len(re.findall(r"^Controller\s", listed["output"], re.M))
+        properties = {}
+        for key in ("Powered", "Discoverable", "Pairable"):
+            match = re.search(r"^\s*" + key + r":\s*(yes|no)", shown["output"], re.M)
+            properties[key.lower()] = match.group(1) == "yes" if match else None
+        listed["output"] = "controllers=" + str(count)
+        shown["output"] = properties
+        report["bluetooth"] = {
+            "backend": "bluetoothctl (system BlueZ)",
+            "tools": {name: bool(which(name)) for name in ("bluetoothctl", "bluetoothd", "rfkill", "gdbus")},
+            "service": probe(["systemctl", "is-active", "bluetooth.service"]),
+            "system_bus_bluez_owner": probe(["gdbus", "call", "--system", "--dest",
+                "org.freedesktop.DBus", "--object-path", "/org/freedesktop/DBus", "--method",
+                "org.freedesktop.DBus.NameHasOwner", "org.bluez"]),
+            "list": listed, "show": shown,
+            "rfkill": probe(["rfkill", "list", "bluetooth"]),
+            "state": bluetooth_state(),
+        }
+    if mode in ("--diagnose", "--diagnose-audio"):
+        audio = discover_audio_outputs()
+        devices = audio.get("devices", [])
+        # Sink names may embed a Bluetooth address or hostname: use a local index.
+        report["audio"] = {"status": audio["status"], "backend": audio.get("backend", ""),
+            "server": audio.get("server", "unknown"), "outputs": len(devices),
+            "default_output_index": next((i for i, d in enumerate(devices)
+                if d["id"] == audio.get("default")), None),
+            "tools": {name: bool(which(name)) for name in ("pactl", "wpctl", "pipewire")}}
+        backend = audio.get("backend")
+        command = (["pactl", "get-sink-volume", "@DEFAULT_SINK@"] if backend == "pactl"
+                   else ["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
+        report["audio"]["volume_readable"] = bool(backend) and probe(command)["status"] == "success"
+        mute_command = (["pactl", "get-sink-mute", "@DEFAULT_SINK@"] if backend == "pactl" else command)
+        report["audio"]["mute_readable"] = bool(backend) and probe(mute_command)["status"] == "success"
+    if mode == "--diagnose":
+        report["capabilities"] = {name: bool(which(tool)) for name, tool in {
+            "network_cli": "nmcli", "media_cli": "playerctl", "battery_cli": "upower",
+            "sensors_cli": "sensors", "storage_cli": "lsblk", "display_cli": "xrandr"}.items()}
+        report["gtk"] = "%s.%s.%s" % (Gtk.get_major_version(), Gtk.get_minor_version(), Gtk.get_micro_version())
+        report["config_path"] = CONFIG_FILE
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+
 def main():
+    diagnostic = next((arg for arg in sys.argv[1:] if arg.startswith("--diagnose")), None)
+    if diagnostic:
+        if diagnostic not in ("--diagnose", "--diagnose-bluetooth", "--diagnose-audio"):
+            raise SystemExit("Unknown diagnostic mode")
+        # libpulse can create a cookie even for a read command. Use a private,
+        # ephemeral client configuration; never start a server or create a
+        # persistent PulseAudio configuration/cookie during diagnostics.
+        with tempfile.TemporaryDirectory(prefix="cc-diagnose-") as directory:
+            client = os.path.join(directory, "client.conf")
+            with open(client, "w", encoding="ascii") as stream:
+                stream.write("autospawn = no\ncookie-file = /dev/null\n")
+            os.environ["PULSE_CLIENTCONFIG"] = client
+            diagnose(diagnostic)
+        return
+    if "--direct" in sys.argv[1:]:
+        # A terminal debugging instance must not signal an old resident process.
+        # It neither publishes nor removes the resident's PID/runtime files.
+        logging.basicConfig(level=logging.INFO)
+        win = ControlCenter()
+        win.show_all()
+        win.present()
+        Gtk.main()
+        return
     resident = "--daemon" in sys.argv[1:]
     internal_restart = os.environ.pop("CC_INTERNAL_RESTART", "") == "1"
     # Register the Unix signal source before publishing the PID. The launcher

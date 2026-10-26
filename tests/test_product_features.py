@@ -16,7 +16,7 @@ for node in tree.body:
 
 version = ast.literal_eval(assignments["APP_VERSION"])
 assert version == (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-assert version == "2.0.0"
+assert version == "2.1.0"
 
 keys = ast.literal_eval(assignments["QUICK_ACTION_KEYS"])
 assert {"quick_notes", "storage_analyzer", "fan_control", "shotmenu", "kbd_light"} <= set(keys)
@@ -26,8 +26,11 @@ required_strings = (
     "storage_title", "storage_mode_folders", "storage_mode_largest", "storage_mode_types",
     "storage_cancel", "storage_export_csv", "fan_control", "fan_read_only",
     "fan_refresh", "fan_export_csv", "fan_history_temp", "fan_history_rpm",
-    "theme_midnight", "theme_graphite", "theme_light", "accent_blue", "accent_purple",
-    "accent_teal", "accent_pink", "language_auto", "language_de", "language_en",
+    "theme_midnight", "theme_graphite", "theme_frosted", "theme_light",
+    "accent_blue", "accent_purple", "accent_teal", "accent_pink", "accent_red",
+    "accent_orange", "accent_yellow", "accent_green", "accent_graphite",
+    "setting_theme", "setting_accent", "setting_language", "setting_media_card",
+    "setting_animation_speed", "language_auto", "language_de", "language_en",
     "language_it", "language_fr", "language_es", "animation_smooth", "animation_fast",
     "animation_off", "kbd_off", "kbd_on", "kbd_bright", "kbd_cycle_tip",
 )
@@ -50,6 +53,7 @@ assert 'dict(key="shotmenu", svg="camera", title=T("quick_screenshot")' in text
 # Direct Control Center pickers/settings and keyboard accessibility.
 for method in ("_fill_theme_options", "_fill_accent_options", "_fill_language_options",
                "_fill_animation_options", "_select_setting", "_select_language",
+               "_settings_group", "_settings_choice", "_settings_toggle",
                "_fill_settings", "_fill_diag", "_copy_diagnostics"):
     assert method in methods, f"Missing settings/diagnostics method: {method}"
 assert "_focus_guard_until = time.monotonic() + 0.75" in text
@@ -71,7 +75,12 @@ media_source = ast.get_source_segment(text, media_fn)
 assert '{{mpris:artUrl}}' in media_source and '{{mpris:length}}' in media_source
 assert '"playerctl", "position"' in media_source
 assert "self._m_progress.set_fraction" in method_text("_set_media")
-assert 'set_size_request(88, 50)' in method_text("_build_media")
+assert 'set_size_request(56, 56)' in method_text("_build_media")
+assert "self._media_controls.append(b)" in method_text("_build_media")
+assert "button.set_sensitive(False)" in method_text("_set_media")
+assert "self._m_progress_row.hide()" in method_text("_set_media")
+# Runtime visibility and persistence are exercised by test_preferences_runtime.py.
+assert 'CFG.get("media_progress", True)' in method_text("_set_media")
 assert "_media_cover_worker" in methods and "_format_media_time" in methods
 
 # Wi-Fi details expose IP, gateway, DNS and reuse already-fetched connection data.
@@ -79,7 +88,7 @@ summary = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name
 summary_src = ast.get_source_segment(text, summary)
 assert '"IP4.DNS"' in summary_src and "networks=None" in summary_src
 assert 'wifi_connection_summary(networks)' in method_text("_detail_worker")
-assert 'T("network_dns"' in method_text("_detail_fill")
+assert '"network_dns"' in method_text("_detail_fill")
 
 # Multi-note storage is atomic/private, supports create/delete/list and legacy migration.
 for name in ("notes_storage_dir", "_canonical_note_id", "save_quick_note", "delete_quick_note", "list_quick_notes"):

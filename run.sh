@@ -3,7 +3,9 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)" || exit 1
 case "${1:-}" in
   --direct)
-    shift
+    exec python3 "$HERE/macos-control-center" "$@"
+    ;;
+  --diagnose|--diagnose-bluetooth|--diagnose-audio)
     exec python3 "$HERE/macos-control-center" "$@"
     ;;
   --daemon)

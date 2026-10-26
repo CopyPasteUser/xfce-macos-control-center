@@ -7,6 +7,7 @@ import os
 import stat
 import tempfile
 import sys
+import logging
 import urllib.parse, ipaddress, re
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,6 +84,7 @@ for node in TREE.body:
 ns = {
     "os": os, "json": json, "tempfile": tempfile, "urllib": urllib, "ipaddress": ipaddress, "re": re,
     "VPN_PREFERRED": "simon",
+    "logging": logging,
 }
 exec(compile(ast.Module(body=pure_nodes, type_ignores=[]), str(SOURCE), "exec"), ns)
 

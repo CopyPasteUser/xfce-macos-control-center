@@ -1,3 +1,16 @@
+# Version 2.1.0 · 2026-10-26
+
+- Settings-Aufbau repariert: Theme-/Accent-Previews verwenden wieder das erwartete Format; Aufbaufehler werden sichtbar protokolliert und die Ansicht bleibt erneut öffnbar.
+- Bluetooth-Powerpfad repariert: doppelte Worker-Definition entfernt, Adapter-, BlueZ-, rfkill- und Powered-Zustände getrennt behandelt.
+- Bluetooth verwendet keinen automatischen sudo/systemctl-Service-Start; nach `bluetoothctl power on/off` wird der echte Zustand erneut gelesen.
+- Audio-Discovery beendet Loading zuverlässig, bewahrt bereite Geräte während Refresh und härtet pactl/wpctl-Fallback, Parsing und Output-Wechsel.
+- Generation Guards für Bluetooth, Detailseiten, Passwortdialoge und zerstörte Widgets ergänzt.
+- Read-only-Diagnosemodi `--diagnose`, `--diagnose-bluetooth` und `--diagnose-audio` ergänzt.
+- Config-Schema, atomisches Schreiben, Wiederherstellung beschädigter Dateien und Zukunftskompatibilität gehärtet.
+- Persistierte Media-/Feedback-Einstellungen ergänzt; Themes besitzen vollständige Warnungs-/Fehlerfarben.
+- Realitätsnähere Settings-, Bluetooth-, Audio-, Lifecycle-, Diagnose- und Strict-Audit-Tests ergänzt.
+- Vollständige Suite inklusive Installer/Update und LocalSend-Sandbox erfolgreich.
+
 # Version 2.0.0 · 2026-10-25
 
 - Aktionssuche mit Strg+F/Enter, Kategorien und gespeicherter kompakter Ansicht.

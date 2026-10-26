@@ -1,4 +1,23 @@
-# Prüfprotokoll · 2.0.0 · 2026-10-25
+# Prüfprotokoll · 2.1.0 · 2026-10-26
+
+## 2.1 Ergebnis
+
+`bash run-tests.sh` endet mit `ALLE PROJEKTTESTS BESTANDEN`. Enthalten sind
+Settings-Konstruktion und Wiederöffnung, realitätsnahe Bluetooth-CLI-Semantik,
+Audio-Discovery/Selection, stale Callback Guards, Config-Wiederherstellung,
+Diagnose-Nebenwirkungsprüfung, Theme-CSS-Matrix und Strict Audit.
+
+Die Tests prüfen keine reale Bluetooth-/Audio-Hardware. Der vorhandene Headless-
+GTK-Test überspringt den echten Widget-/Stack-Teil ausdrücklich, wenn kein
+Display erreichbar ist.
+
+Die verfügbaren read-only Diagnosebefehle sind:
+
+```text
+./run.sh --diagnose
+./run.sh --diagnose-bluetooth
+./run.sh --diagnose-audio
+```
 
 ## Ausgangsarchiv
 
@@ -7,7 +26,7 @@ Originaltests vor Änderungen ausgeführt. Reine Python-/Konfigurations-/Utility
 Tests und Shellsyntax bestanden. Zwei Prozessintegrationstests bereits im
 Original fehlgeschlagen.
 
-## Erfolgreich in 2.0
+## Erfolgreich in 2.1
 
 `bash run-tests.sh --portable`: Codeverträge, fünfsprachige Texte, private
 Konfiguration, Alt-Migration, Schnellaktionen, Layoutlogik, Fokus-/Togglelogik,

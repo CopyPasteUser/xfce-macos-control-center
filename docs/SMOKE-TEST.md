@@ -1,10 +1,10 @@
-# Manueller Smoke-Test – macOS Control Center 1.3.1
+# Manueller Smoke-Test – macOS Control Center 2.1.0
 
 Diese Checkliste nach Updates an GTK, Medienwidget, Fensterlayout oder Toggle-Lifecycle auf dem Ziel-Desktop abarbeiten.
 
 ## Popup und Bedienung
 
-1. Panel-Starter öffnet das Popup; ein zweiter Klick schließt es und ein dritter öffnet es wieder.
+1. Panel-Starter öffnet das Popup; ein zweiter Klick schließt es und ein dritter öffnet es wieder. `./run.sh --direct` öffnet eine eigene Debug-Instanz.
 2. Popup bleibt deckend und oben rechts. Es gibt keine zusätzliche Kopfzeile mit Logo/Close-Button.
 3. Auf einem kleinen Monitor bleibt der Inhalt erreichbar; lange Einstellungs-/Detailmenüs scrollen statt abgeschnitten zu werden.
 4. Menüanimationen folgen der Einstellung (Flüssig/Schnell/Aus) und der Option für reduzierte Bewegung.
@@ -33,12 +33,27 @@ Diese Checkliste nach Updates an GTK, Medienwidget, Fensterlayout oder Toggle-Li
 ## Update und Sicherheitsgrenzen
 
 20. `bash ./status.sh` prüft Release-/Installationsversion, Runtime-Version, PID und Codepfad.
+
+## 2.1 Hardware- und Diagnoseprüfung
+
+21. `./run.sh --diagnose-bluetooth` ausführen. Dienst, System-Bus, Adapter,
+Powered und rfkill müssen getrennt angezeigt werden; der Befehl darf nichts ändern.
+22. `./run.sh --diagnose-audio` ausführen. Ausgewähltes Backend, Default-Ausgang,
+Ausgangsanzahl sowie Volume-/Mute-Lesbarkeit prüfen.
+23. Settings öffnen, zurückgehen und mehrfach erneut öffnen. Theme-/Accent-Preview
+und Persistenz prüfen.
+24. Bluetooth aus-/einschalten. Bei Soft-Block muss der Adapterpfad den echten
+Zustand nach dem Unblocken verifizieren; bei Hard-Block darf kein Optimismus-UI
+stehen bleiben.
+25. Sound öffnen: Output Devices muss Loading verlassen und `READY`, `EMPTY`,
+`UNAVAILABLE`, `TIMEOUT` oder `ERROR` anzeigen. Output-Wechsel und Mute/Volume
+prüfen, sofern Hardware vorhanden ist.
 21. Ein neues Release in einem neuen Ordner entpacken und dort `bash ./update.sh` starten; alte Instanzen müssen sicher beendet und der neue Daemon verifiziert werden.
 22. `bash ./run-tests.sh` muss ohne Fehler enden.
 23. LocalSend mit `flatpak info --show-permissions org.localsend.localsend_app` prüfen: `/mnt/medien` darf nicht freigegeben sein.
 24. Installer/Tests dürfen keine XFCE-Panel-, Theme-, Icon-Theme-, Plank-, Wallpaper- oder Whisker-Einstellungen verändern.
 
 
-## Version 2.0
+## Version 2.1
 
 Zusätzliche Prüfungen und Grenzen: siehe `VALIDATION.md`, Abschnitt „Auf einem XFCE-Zielgerät“.
